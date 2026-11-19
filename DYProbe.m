@@ -387,7 +387,7 @@ static id dy_body_5_o(id self, SEL _cmd, id a, id b, id c, id d, id e) {
 
 /* ---------- 通用 n 对象参数 trampoline（n=1/3/4/6，宏生成，避免遗漏未知签名） ---------- */
 #define DY_DEF_BODY_GN(n, ret) \
-static ret dy_body_g##n##_##ret(id self, SEL _cmd, \
+static ret dy_body_g##n##_o(id self, SEL _cmd, \
     id a1,id a2,id a3,id a4,id a5,id a6) { \
     NSString *tag=[NSString stringWithFormat:@"%@|%@",NSStringFromClass([self class]),NSStringFromSelector(_cmd)]; \
     id p[6]={a1,a2,a3,a4,a5,a6}; \
