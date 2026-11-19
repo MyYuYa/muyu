@@ -1,85 +1,67 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <string.h>
 
 /*
- * DYProbe v4 - 抖音 41.0.0 评论 textExtra 结构探针（防闪退版）
+ * DYProbe v5 - 抖音 41.0.0 评论 type 批量轮询注入版
  * 纯 Objective-C runtime swizzle，不依赖 Cydia Substrate / Logos。
  *
- * v3 相对 v2 的关键修复（v2 因深度 dump 高频 model 导致闪退）：
- *  1) 只 hook 类名含 "Comment" / "Publish" 的对象；不再碰 AWEAwemeModel / AWEUserModel 等高频 model
- *  2) 参数只做 description + 白名单属性读取，绝不遍历 ivar（object_getIvar 是闪退元凶）
- *  3) KVC 读取加 try/catch，读不到就跳过
- *  4) 全局频率闸门：每 0.3s 最多 dump 一次，最多 dump 20 次，防止刷屏/卡顿
- *  5) 去掉会导致透传异常的 NSURLProtocol，专注 model 层
+ * 原理（对齐油猴脚本的批量测试）：
+ *  - 网页脚本: 自己构造 body, type 想填多少填多少 -> 轮询测出 21=红
+ *  - App 脚本: body 由 App(Swift/KMP)构造, 我们只能 hook 它现成的
+ *              AWETextExtra 对象的 setType:, 在 App 构造 @/# textExtra 时
+ *              把 type 改成「当前轮询值」。
+ *
+ * 用法:
+ *  1) 装上后打开抖音, 弹窗显示「DYProbe v5 批量测试」
+ *  2) 发一条带 @ 或 # 的评论 (纯文字评论 App 不构造 textExtra, 无效)
+ *  3) 每隔 2 秒再发一条 —— type 会自动 +1 (15->30 循环)
+ *  4) 到【网页端】看哪条评论变红/变色 (网页端不受本插件影响, 结果最准)
+ *  5) 导出 dyprobe_dump.txt 发回: 里面有每条评论发出时刻的 type 值
+ *
+ * 防闪退 (继承 v3/v4):
+ *  - 只 hook 类名精确等于 AWETextExtra 的 setType:, 不碰其它类
+ *  - 参数按 type encoding 自适应 (标量 int / NSNumber 对象)
+ *  - 展示链路只读 dump, 不遍历 ivar, 不深度反射 self
+ *  - 全程 try/catch + 频率闸门 + 日志上限
  */
 
+/* ---------- 配置 ---------- */
+#define DY_TYPE_FROM 15
+#define DY_TYPE_TO   30
+#define DY_INTERVAL  2.0
+
 static NSMutableString *gBuf = nil;
+static NSMutableDictionary *gOrigByKey = nil;
+static NSMutableSet *gHookedKeys = nil;
 static NSInteger gHit = 0;
 static NSDate *gLastPop = nil;
 static NSDate *gLastDump = nil;
-static NSMutableSet *gHookedKeys = nil;
-static NSMutableDictionary *gOrigByKey = nil;
 static NSInteger gDumpCount = 0;
-static int gScanRound = 0;
+static NSInteger gCurrentType = DY_TYPE_FROM;
+static NSTimer *gPollTimer = nil;
+
+/* setType: 原始 IMP 与参数种类 */
+static IMP gOrigSetType = NULL;
+static int  gSetTypeKind = 0;   /* 1=标量int  2=NSNumber对象 */
+static NSInteger gSetTypeCalls = 0;
 
 static void DYAppend(NSString *line) {
     if (!gBuf) gBuf = [NSMutableString string];
-    if (gBuf.length > 60000) return;   // 防止日志无限膨胀
+    if (gBuf.length > 60000) return;
     [gBuf appendFormat:@"%@\n", line];
     NSLog(@"[DYPROBE] %@", line);
 }
 
-/* 只取 description，安全，不碰 ivar */
 static NSString *DYSafe(id obj) {
     if (!obj) return @"(nil)";
     @try {
         NSString *d = [obj description];
         if (!d) return @"(nil desc)";
-        return d.length > 900 ? [[d substringToIndex:900] stringByAppendingString:@" ...(truncated)"] : d;
+        return d.length > 800 ? [[d substringToIndex:800] stringByAppendingString:@" ...(truncated)"] : d;
     } @catch (NSException *e) {
         return [NSString stringWithFormat:@"<desc threw:%@>", e.name];
-    }
-}
-
-/* 只 dump 安全的可读属性（白名单名字），绝不遍历 ivar */
-static void DYDumpObjSafe(id obj, NSString *label) {
-    if (!obj) return;
-    @try {
-        DYAppend([NSString stringWithFormat:@"--- %@ | class=%@ ---", label, NSStringFromClass([obj class])]);
-        DYAppend([NSString stringWithFormat:@"  desc: %@", DYSafe(obj)]);
-        unsigned int pc = 0;
-        objc_property_t *props = class_copyPropertyList([obj class], &pc);
-        NSInteger shown = 0;
-        for (unsigned int i=0;i<pc && shown<25;i++) {
-            NSString *name = [NSString stringWithUTF8String:property_getName(props[i])];
-            NSString *low = [name lowercaseString];
-            BOOL interesting = ([low rangeOfString:@"text"].location!=NSNotFound ||
-                                [low rangeOfString:@"extra"].location!=NSNotFound ||
-                                [low rangeOfString:@"type"].location!=NSNotFound ||
-                                [low rangeOfString:@"start"].location!=NSNotFound ||
-                                [low rangeOfString:@"end"].location!=NSNotFound ||
-                                [low rangeOfString:@"user"].location!=NSNotFound ||
-                                [low rangeOfString:@"range"].location!=NSNotFound ||
-                                [low rangeOfString:@"content"].location!=NSNotFound);
-            if (!interesting) continue;
-            @try {
-                id v = [obj valueForKey:name];
-                NSString *vs = DYSafe(v);
-                DYAppend([NSString stringWithFormat:@"  [prop] %@ = %@", name, vs]);
-                shown++;
-                if ([v isKindOfClass:[NSArray class]] && [(NSArray*)v count] && [(NSArray*)v count]<=10) {
-                    NSArray *arr = (NSArray*)v;
-                    DYAppend([NSString stringWithFormat:@"      array(%lu):", (unsigned long)arr.count]);
-                    for (id e in arr) DYAppend([NSString stringWithFormat:@"        - %@", DYSafe(e)]);
-                }
-            } @catch (NSException *e) {
-                DYAppend([NSString stringWithFormat:@"  [prop] %@ = <skip:%@>", name, e.name]);
-            }
-        }
-        free(props);
-    } @catch (NSException *e) {
-        DYAppend([NSString stringWithFormat:@"dump safe failed: %@", e.name]);
     }
 }
 
@@ -120,8 +102,8 @@ static void DYPop(void) {
         if (!vc) return;
         @try {
             NSString *preview = gBuf ? (gBuf.length > 400 ? [gBuf substringToIndex:400] : gBuf) : @"(empty)";
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v4 已捕获"
-                message:[NSString stringWithFormat:@"命中 %ld 次，已复制到剪贴板。\n\n---- 预览 ----\n%@", (long)gHit, preview]
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v5 批量测试"
+                message:[NSString stringWithFormat:@"type 每 2 秒 +1。发一条带 @ 或 # 的评论，间隔 2 秒再发下一条。已复制到剪贴板。\n\n当前 type=%ld\n\n---- 预览 ----\n%@", (long)gCurrentType, preview]
                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"再复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ DYCopyToPasteboard(); }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
@@ -130,122 +112,168 @@ static void DYPop(void) {
     });
 }
 
-/* 频率闸门：返回 YES 才允许本次 dump */
 static BOOL DYGate(void) {
-    if (gDumpCount >= 60) return NO;
+    if (gDumpCount >= 80) return NO;
     NSDate *now = [NSDate date];
-    if (gLastDump && [now timeIntervalSinceDate:gLastDump] < 0.15) return NO;
+    if (gLastDump && [now timeIntervalSinceDate:gLastDump] < 0.2) return NO;
     gLastDump = now;
     gDumpCount++;
     return YES;
 }
 
-#pragma mark - 通用 dump 触发器
+#pragma mark - 发布链路：hook AWETextExtra setType:
 
-/* void (id,SEL) —— 无参方法 */
-static void dy_dump_0(id self, SEL _cmd) {
-    NSString *key = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    IMP orig = [gOrigByKey[key] pointerValue];
-    if (orig && orig != (IMP)dy_dump_0) { @try { ((void(*)(id,SEL))orig)(self,_cmd); } @catch (...) {} }
-    @try {
-        gHit++;
-        if (!DYGate()) return;
-        DYAppend([NSString stringWithFormat:@"========== [void] %@ on %@ ==========", NSStringFromSelector(_cmd), NSStringFromClass([self class])]);
-        DYSave(); DYPop();
-    } @catch (...) {}
+/* 判断 setType: 的参数种类：1=标量整型 2=NSNumber 对象 */
+static int DYSetTypeArgKind(const char *enc) {
+    if (!enc) return 0;
+    const char *colon = strchr(enc, ':');
+    if (!colon) return 0;
+    for (const char *p = colon + 1; *p; p++) {
+        if (*p >= '0' && *p <= '9') continue;
+        if (*p == '@') return 2;                       /* NSNumber */
+        if (*p=='i'||*p=='l'||*p=='q'||*p=='I'||*p=='L'||*p=='Q') return 1;  /* int/long */
+        if (*p=='"') break;
+    }
+    return 0;
 }
 
-/* void (id,SEL,id) —— 单参 setter */
+/* 标量 int 版 setType: */
+static void dy_setType_int(id self, SEL _cmd, int v) {
+    @try {
+        gSetTypeCalls++;
+        gHit++;
+        DYAppend([NSString stringWithFormat:@"[SET-TYPE #%ld] 原值=%d  ->  注入=%ld (当前轮询值) on %@",
+                  (long)gSetTypeCalls, v, (long)gCurrentType, NSStringFromClass([self class]))];
+    } @catch (...) {}
+    if (gOrigSetType && gOrigSetType != (IMP)dy_setType_int) {
+        @try { ((void(*)(id,SEL,int))gOrigSetType)(self, _cmd, (int)gCurrentType); } @catch (...) {}
+    }
+}
+
+/* NSNumber 对象版 setType: */
+static void dy_setType_obj(id self, SEL _cmd, id v) {
+    @try {
+        gSetTypeCalls++;
+        gHit++;
+        DYAppend([NSString stringWithFormat:@"[SET-TYPE #%ld] 原值=%@  ->  注入=%ld (当前轮询值) on %@",
+                  (long)gSetTypeCalls, DYSafe(v), (long)gCurrentType, NSStringFromClass([self class]))];
+    } @catch (...) {}
+    if (gOrigSetType && gOrigSetType != (IMP)dy_setType_obj) {
+        @try { ((void(*)(id,SEL,id))gOrigSetType)(self, _cmd, @(gCurrentType)); } @catch (...) {}
+    }
+}
+
+#pragma mark - 展示链路：只读 dump（观察服务端存回的 type）
+
 static void dy_dump_1(id self, SEL _cmd, id arg) {
     NSString *key = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
     IMP orig = [gOrigByKey[key] pointerValue];
     if (orig && orig != (IMP)dy_dump_1) { @try { ((void(*)(id,SEL,id))orig)(self,_cmd,arg); } @catch (...) {} }
     @try {
-        gHit++;
         if (!DYGate()) return;
-        DYAppend([NSString stringWithFormat:@"========== [obj] %@ on %@ ==========", NSStringFromSelector(_cmd), NSStringFromClass([self class])]);
-        DYDumpObjSafe(arg, @"arg");
-        DYSave(); DYPop();
+        gHit++;
+        DYAppend([NSString stringWithFormat:@"========== [展示] %@ on %@ ==========", NSStringFromSelector(_cmd), NSStringFromClass([self class])]);
+        if ([arg isKindOfClass:[NSArray class]]) {
+            NSArray *arr = (NSArray *)arg;
+            DYAppend([NSString stringWithFormat:@"  textExtras 数量: %lu", (unsigned long)arr.count]);
+            for (id e in arr) {
+                NSString *et = @"?";
+                @try { et = [NSString stringWithFormat:@"%@", [e valueForKey:@"type"] ?: @"(nil)"]; } @catch (...) {}
+                NSString *st = @"?", *en = @"?";
+                @try { st = [NSString stringWithFormat:@"%@", [e valueForKey:@"start"] ?: @"(nil)"]; } @catch (...) {}
+                @try { en = [NSString stringWithFormat:@"%@", [e valueForKey:@"end"] ?: @"(nil)"]; } @catch (...) {}
+                DYAppend([NSString stringWithFormat:@"    extra: type=%@ start=%@ end=%@  class=%@", et, st, en, NSStringFromClass([e class])]);
+            }
+        }
+        DYSave();
     } @catch (...) {}
 }
 
-/*
- * 按签名选 IMP（v4 修正）：参数个数 = _cmd 冒号【之后】的对象 token 数。
- * v1-v3 错误地数了整个串里的冒号数，导致单参 setter 被当成无参方法。
- *   v@:    -> 0 参 -> dy_dump_0
- *   v@:@   -> 1 参 -> dy_dump_1   (如 setTextExtras: v24@0:8@16)
- *   v@:@@  -> 2 参 -> 跳过（防崩）
- *   v@:@"NSArray" -> 1 参（引号内类名跳过）
- */
-static IMP DYPickIMP(const char *enc) {
-    if (!enc || enc[0] != 'v') return NULL;   // 只 hook void 返回
-    // 去掉 offset / frame size 数字： v24@0:8@16 -> v@:@
-    NSMutableString *t = [NSMutableString string];
-    for (const char *p=enc; *p; p++) if (*p < '0' || *p > '9') [t appendFormat:@"%c", *p];
-    NSString *sig = t;
-    NSRange colon = [sig rangeOfString:@":"];
-    if (colon.location == NSNotFound) return NULL;
-    NSString *args = [sig substringFromIndex:colon.location + 1];  // _cmd 之后才是参数
-    NSInteger objCount = 0;
-    BOOL inQuote = NO;
-    for (NSUInteger i=0; i<args.length; i++) {
-        unichar c = [args characterAtIndex:i];
-        if (c == '"') { inQuote = !inQuote; continue; }   // @"ClassName" / @"<Protocol>"
-        if (inQuote) continue;
-        if (c == '@') objCount++;
-        else return NULL;   // 出现非对象参数（标量/结构体/block）→ 跳过，防崩
+#pragma mark - hook 安装
+
+static void DYInstallSetTypeHook(void) {
+    @try {
+        Class ec = objc_getClass("AWETextExtra");
+        if (!ec) { DYAppend(@"[HOOK] AWETextExtra 类未注册, 等下一轮"); return; }
+        Method m = class_getInstanceMethod(ec, @selector(setType:));
+        if (!m) { DYAppend(@"[HOOK] AWETextExtra 无 setType:, 等下一轮"); return; }
+        if (gSetTypeCalls < 0) return;
+        const char *enc = method_getTypeEncoding(m);
+        DYAppend([NSString stringWithFormat:@"[HOOK] AWETextExtra setType: enc=%s", enc ? enc : "?"]);
+        int kind = DYSetTypeArgKind(enc);
+        if (kind == 1) {
+            gOrigSetType = method_setImplementation(m, (IMP)dy_setType_int);
+            gSetTypeKind = 1;
+            DYAppend(@"[HOOK] setType: 已挂钩 (标量 int)");
+        } else if (kind == 2) {
+            gOrigSetType = method_setImplementation(m, (IMP)dy_setType_obj);
+            gSetTypeKind = 2;
+            DYAppend(@"[HOOK] setType: 已挂钩 (NSNumber 对象)");
+        } else {
+            DYAppend(@"[HOOK] setType: 参数种类未知, 跳过以防崩");
+        }
+    } @catch (NSException *e) {
+        DYAppend([NSString stringWithFormat:@"[HOOK] setType: 安装异常 %@", e.name]);
     }
-    if (objCount == 0) return (IMP)dy_dump_0;
-    if (objCount == 1) return (IMP)dy_dump_1;
-    return NULL;
 }
 
-/* 只 hook 评论/发布相关的类，避开视频/用户等高频 model */
-static BOOL DYIsTargetClass(NSString *clsName) {
-    NSString *low = [clsName lowercaseString];
-    return ([low rangeOfString:@"comment"].location != NSNotFound ||
-            [low rangeOfString:@"publish"].location != NSNotFound);
-}
-
-static void DYScanAndHook(void) {
-    NSSet *targets = [NSSet setWithArray:@[
-        @"setTextExtra:", @"setTextExtras:", @"setTextExtraArray:", @"setTextExtraModel:", @"setTextExtraDict:",
-        @"setCommentTextExtra:", @"setContentTextExtraModelArray:",
-        @"addMentionTextExtraWithModel:", @"appendTextExtraWithExtra:",
-        @"submitTextExtras", @"checkSubmitTextExtras", @"updateTextExtra", @"updateTextExtras",
-        @"setChangedTextExtra:", @"setRealTextExtras:", @"setMentionTextExtras:",
-        @"setOriginTextExtras:"
-    ]];
-
+static void DYScanAndHookDisplay(void) {
+    NSSet *targets = [NSSet setWithArray:@[ @"setTextExtras:" ]];
     unsigned int cc = 0;
     Class *classes = objc_copyClassList(&cc);
     NSInteger hooked = 0;
-    for (unsigned int i = 0; i < cc; i++) {
-        Class cls = classes[i];
-        NSString *clsName = NSStringFromClass(cls);
-        if (!DYIsTargetClass(clsName)) continue;   // 关键：类白名单
-        unsigned int mc = 0;
-        Method *mlist = class_copyMethodList(cls, &mc);
-        for (unsigned int j = 0; j < mc; j++) {
-            SEL ms = method_getName(mlist[j]);
-            NSString *selName = NSStringFromSelector(ms);
-            if (![targets containsObject:selName]) continue;
-            NSString *key = [NSString stringWithFormat:@"%@|%@", clsName, selName];
-            if ([gHookedKeys containsObject:key]) continue;
-            const char *enc = method_getTypeEncoding(mlist[j]);
-            IMP newIMP = DYPickIMP(enc);
-            if (!newIMP) continue;
-            IMP orig = method_setImplementation(mlist[j], newIMP);
-            gOrigByKey[key] = [NSValue valueWithPointer:orig];
-            [gHookedKeys addObject:key];
-            hooked++;
-            DYAppend([NSString stringWithFormat:@"HOOKED %@ enc=%s", key, enc ? enc : "?"]);
+    @try {
+        for (unsigned int i = 0; i < cc; i++) {
+            Class cls = classes[i];
+            NSString *clsName = NSStringFromClass(cls);
+            if (![clsName isEqualToString:@"AWECommentModel"]) continue;  /* 精确类, 不碰高频 model */
+            unsigned int mc = 0;
+            Method *mlist = class_copyMethodList(cls, &mc);
+            for (unsigned int j = 0; j < mc; j++) {
+                SEL ms = method_getName(mlist[j]);
+                NSString *selName = NSStringFromSelector(ms);
+                if (![targets containsObject:selName]) continue;
+                NSString *key = [NSString stringWithFormat:@"%@|%@", clsName, selName];
+                if ([gHookedKeys containsObject:key]) continue;
+                const char *enc = method_getTypeEncoding(mlist[j]);
+                /* 只接单对象参 void: v@:@ */
+                NSString *sig = @"";
+                NSMutableString *t = [NSMutableString string];
+                for (const char *p=enc; *p; p++) if (*p<'0'||*p>'9') [t appendFormat:@"%c",*p];
+                sig = t;
+                if (![sig isEqualToString:@"v@:@"]) continue;
+                IMP orig = method_setImplementation(mlist[j], (IMP)dy_dump_1);
+                gOrigByKey[key] = [NSValue valueWithPointer:orig];
+                [gHookedKeys addObject:key];
+                hooked++;
+                DYAppend([NSString stringWithFormat:@"[HOOK-DISP] %@ enc=%s", key, enc]);
+            }
+            free(mlist);
         }
-        free(mlist);
-    }
+    } @catch (...) {}
     free(classes);
-    DYAppend([NSString stringWithFormat:@"=== scan round %d: +%ld hooks (total %lu) ===", gScanRound, (long)hooked, (unsigned long)gHookedKeys.count]);
+    DYAppend([NSString stringWithFormat:@"[HOOK-DISP] 本轮 +%ld (总 %lu)", (long)hooked, (unsigned long)gHookedKeys.count]);
     DYSave();
+}
+
+#pragma mark - 轮询定时器
+
+static void DYStartPolling(void) {
+    gCurrentType = DY_TYPE_FROM;
+    DYAppend([NSString stringWithFormat:@"[POLL] 启动: type 从 %d 到 %d, 每 %.0f 秒 +1", DY_TYPE_FROM, DY_TYPE_TO, DY_INTERVAL]);
+    @try {
+        gPollTimer = [NSTimer scheduledTimerWithTimeInterval:DY_INTERVAL repeats:YES block:^(NSTimer *t) {
+            @autoreleasepool {
+                gCurrentType++;
+                if (gCurrentType > DY_TYPE_TO) gCurrentType = DY_TYPE_FROM;
+                DYAppend([NSString stringWithFormat:@"[POLL] === 当前 type = %ld === (现在发的评论用这个值)", (long)gCurrentType]);
+                DYSave();
+            }
+        }];
+        if (gPollTimer) [[NSRunLoop mainRunLoop] addTimer:gPollTimer forMode:NSRunLoopCommonModes];
+    } @catch (NSException *e) {
+        DYAppend([NSString stringWithFormat:@"[POLL] 定时器启动失败 %@", e.name]);
+    }
 }
 
 #pragma mark - 入口
@@ -255,8 +283,8 @@ static void DYBootAlert(void) {
         UIViewController *vc = DYTopVC();
         if (!vc) return;
         @try {
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v4 已加载"
-                message:@"防闪退版。去发一条带 @ 或 # 的评论，探针会抓 textExtra 结构并复制到剪贴板。"
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v5 批量测试已加载"
+                message:[NSString stringWithFormat:@"type 每 2 秒自动 +1 (%d→%d)。\n\n发一条带 @ 或 # 的评论，间隔 2 秒发下一条。到网页端看哪条变色，再把本插件的 dyprobe_dump.txt 发回。", DY_TYPE_FROM, DY_TYPE_TO]
                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"开始测试" style:UIAlertActionStyleCancel handler:nil]];
             [vc presentViewController:ac animated:YES completion:nil];
@@ -264,31 +292,29 @@ static void DYBootAlert(void) {
     });
 }
 
-static void DYRoundedScan(void) {
-    gScanRound++;
-    DYAppend([NSString stringWithFormat:@"--- rounded scan #%d ---", gScanRound]);
-    DYScanAndHook();
-    if (gScanRound < 3) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            @autoreleasepool { DYRoundedScan(); }
-        });
-    }
-}
-
 __attribute__((constructor)) static void DYInit(void) {
     @autoreleasepool {
         gBuf = [NSMutableString string];
         gOrigByKey = [NSMutableDictionary dictionary];
         gHookedKeys = [NSMutableSet set];
-        DYAppend(@"DYProbe v4 init (signature-fixed)");
-        DYScanAndHook();
+        DYAppend(@"DYProbe v5 init (type-poll injection)");
         DYSave();
     }
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
         object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
-            DYBootAlert();
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                @autoreleasepool { DYRoundedScan(); }
-            });
+            @autoreleasepool {
+                DYBootAlert();
+                /* 分 3 轮延迟挂钩, 等 Swift/KMP 类注册完成 */
+                for (int r = 0; r < 3; r++) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(r * 1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        @autoreleasepool {
+                            DYAppend([NSString stringWithFormat:@"--- hook round %d ---", r]);
+                            if (gSetTypeCalls == 0 && !gOrigSetType) DYInstallSetTypeHook();
+                            DYScanAndHookDisplay();
+                        }
+                    });
+                }
+                DYStartPolling();
+            }
         }];
 }
