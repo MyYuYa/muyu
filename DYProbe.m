@@ -4,65 +4,45 @@
 #import <string.h>
 
 /*
- * DYProbe v11 - 【打法根本转变：从 model 层转到 body 组装层】
+ * DYProbe v13 — 纯只读诊断探针（零注入 / 零 KVC / 零返回值修改）
+ * ------------------------------------------------------------------
+ * 目的：一次性抓清 iOS 抖音 41.0.0 评论发布链路的【真实 body 结构】与【有效 hook 点】。
  *
- * ===== 为什么 v5~v10 全失败（已证伪，不再重复）=====
- *   v5  改展示回显对象        -> 服务端不读
- *   v6  盲 hook setBodyParams -> 只抓到 Feed 类
- *   v8  改 extraParams 字典   -> 那是统计/上下文字典(author_secuid/common_flags/hashtag)，服务端不读它的 text_extra
- *   v9  改 extraInfo 的 AWETextExtra.type -> 只喂本地渲染(KMP 序列化时重建)，"瞬间红、发出去黑"
- *   v10 值用 65282            -> 2023 老脚本废弃值，服务端已拒绝；21 才是白名单放行值
+ * 根因（41.0.0 砸壳二进制静态分析实锤，不再是猜）：
+ *   评论发布走 Swift/KMP 链路：
+ *     AWECommentSwiftImpl.CommentPublishRequestProvider
+ *     path = aweme/v1/comment/publish/?need_shark_async=1
+ *     参数模型 = AWEKMPBaseCommentPublishParameters
+ *     textExtra 序列化 = AWEKMPTextExtraStructKMPListSerializer
+ *   v5~v12 全部 hook 的是旧 ObjC model（AWECommentPublishParameterModel 那套）
+ *   ——与真正发请求的链路不是同一条，所以本地瞬间红、服务端黑。
  *
- * ===== v11 依据（41.0.0 砸壳包静态分析 + v10 日志）=====
- *   1) type=21 是服务端白名单放行的红字值（2026-11-18 批量实测），网页脚本实测可用
- *   2) 网页脚本：text_extra=[{start:0,end:UTF8字节数,type:21}]，body 里是 JSON 字符串
- *      map.text_extra = encodeURIComponent(JSON.stringify(text_extra))
- *   3) 真正的评论发布链（ObjC 可达，静态符号实锤）：
- *      publishCommentParamsForServer       无参->NSDictionary  ← 组装发给服务端的参数
- *      getPenetrateParamsForServer         无参->NSDictionary  ← 穿透参数
- *      addCommentParams:generalModel:commentModel:textExtras:params:  ← textExtras 数组 + params 字典
- *      publishCommentWithRequest:inputSnapshot:  ← 真正发请求
- *      commentPublishRequestWithSnapshot:refer:
- *      submitTextExtras / checkSubmitTextExtras / trackSubmitTextExtras
+ * 为什么本版不会再闪退：
+ *   v11/v12 崩溃根因是"改"对象——对 Swift/KMP model 做 KVC、mutableCopy 后替换返回值，
+ *   触发信号级 EXC_BAD_ACCESS（@try 抓不住）。本版对任何对象只读不改：
+ *   trampoline 仅记录参数的 description，然后原样转发给原始 IMP。
  *
- * ===== v11 打法 =====
- *   运行时全类扫描，找到实现上述 selector 的类，按 type encoding 严格匹配签名后 hook。
- *   在每一层的"参数字典 / 返回字典 / textExtras 数组"里注入 type=21：
- *     - 数组形式的 text_extra 元素 -> 改 type=21
- *     - 同时写 text_extra=JSON字符串 与 textExtra=数组（覆盖服务端两种可能读法）
- *     - end 用 UTF-8 字节数（与网页脚本一致）
- *   全程 dump 方法签名/参数/返回值到 dyprobe_dump.txt，即使没成功也能一次看清 body 在哪层、什么格式。
- *   保留 extraParams/extraInfo 兜底（本地渲染），值全部改成 21。
+ * 筛选策略：扫描全类方法，方法名命中评论/body/参数/发布关键词的才挂 hook，
+ *   严格 ABI 校验（返回值 @ 或 v，业务参数必须全是对象），其余一律跳过。
  *
- * ===== 防闪退 =====
- *   签名严格匹配才 hook（参数必须全是对象、个数匹配）；全程 @try/catch；
- *   只在确认是字典/数组时才改；日志上限；内容去重；不遍历 ivar。
- * 用法：装上->发一条普通评论（不必@）->去网页端/别人手机看是否红->看 Documents/dyprobe_dump.txt。
+ * 用法：装上 -> 弹窗点"开始" -> 发一条普通评论 -> 去 Documents/dyprobe_dump.txt
+ *       把日志给我。这次评论不会变红（只读版），目的是拿到 body 结构。
  */
 
-#define DY_DUMP_LIMIT 500
+#define DY_LIMIT 700
 
 static NSMutableString *gBuf = nil;
-static NSMutableDictionary *gOrigByHook = nil;
-static NSMutableDictionary *gOrigBySel = nil;
+static NSMutableDictionary *gOrigByHook = nil;   /* key "+-ClassName|sel" -> NSValue(IMP) */
+static NSMutableDictionary *gOrigBySel = nil;    /* fallback by selector name */
 static NSMutableSet *gHookedKeys = nil;
 static NSMutableSet *gSeenHits = nil;
-static NSTimer *gPollTimer = nil;
 static NSInteger gDumpCount = 0;
-static NSInteger gBodyHitCount = 0;      /* body 层注入命中计数 */
-static NSInteger gSetTypeCalls = 0;
-static NSInteger gStackCount = 0;
-static NSInteger gLastContentLen = 0;    /* UTF-16 length */
-static NSInteger gLastContentUTF8Len = 0;/* UTF-8 字节数 */
-static IMP gOrigSetType = NULL;
-static BOOL gHookWarned = NO;
-static BOOL gHookUnsupported = NO;
 
+/* ---------- 即时落盘（崩溃也不丢最后一行） ---------- */
 static void DYAppend(NSString *line) {
     if (!gBuf) gBuf = [NSMutableString string];
     NSString *ln = [NSString stringWithFormat:@"%@\n", line];
-    if (gBuf.length <= 300000) [gBuf appendString:ln];
-    /* 【v12】每条即时增量落盘：崩溃时内存缓冲丢失，但磁盘保留最后一行，便于定位崩溃点 */
+    if (gBuf.length <= 400000) [gBuf appendString:ln];
     @try {
         NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         if (doc) {
@@ -79,47 +59,27 @@ static void DYAppend(NSString *line) {
     NSLog(@"[DYPROBE] %@", line);
 }
 
-static NSString *DYSafe(id obj) {
-    if (!obj) return @"(nil)";
-    @try {
-        NSString *d = [obj description];
-        if (!d) return @"(nil desc)";
-        return d.length > 500 ? [[d substringToIndex:500] stringByAppendingString:@" ...(trunc)"] : d;
-    } @catch (NSException *e) {
-        return [NSString stringWithFormat:@"<desc threw:%@>", e.name];
-    }
-}
-
 static NSString *DYSafeFull(id obj) {
     if (!obj) return @"(nil)";
     @try {
+        NSString *cn = NSStringFromClass([obj class]);
+        if (![obj isKindOfClass:[NSString class]] &&
+            ![obj isKindOfClass:[NSDictionary class]] &&
+            ![obj isKindOfClass:[NSArray class]] &&
+            ![obj isKindOfClass:[NSNumber class]]) {
+            /* 自定义对象（Swift/KMP model）：只打类名，description 可能是垃圾或副作用 */
+            return [NSString stringWithFormat:@"<obj class=%@>", cn ?: @"?"];
+        }
         NSString *d = [obj description];
-        if (!d) return @"(nil desc)";
-        return d.length > 5000 ? [[d substringToIndex:5000] stringByAppendingString:@" ...(trunc5000)"] : d;
+        if (!d) return [NSString stringWithFormat:@"<nil desc class=%@>", cn ?: @"?"];
+        return d.length > 3000 ? [[d substringToIndex:3000] stringByAppendingString:@" ...(trunc)"] : d;
     } @catch (NSException *e) {
         return [NSString stringWithFormat:@"<desc threw:%@>", e.name];
     }
 }
 
-static void DYSave(void) {
-    @try {
-        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        if (!doc) return;
-        [gBuf writeToFile:[doc stringByAppendingPathComponent:@"dyprobe_dump.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    } @catch (...) {}
-}
-
-static void DYCopyToPasteboard(void) {
-    @try { UIPasteboard *pb = [UIPasteboard generalPasteboard]; if (pb) pb.string = (gBuf ?: @""); } @catch (...) {}
-}
-
-static void DYFlushLog(void) {
-    DYSave();
-    dispatch_async(dispatch_get_main_queue(), ^{ DYCopyToPasteboard(); });
-}
-
 static BOOL DYGate(NSString *key) {
-    if (gDumpCount >= DY_DUMP_LIMIT) return NO;
+    if (gDumpCount >= DY_LIMIT) return NO;
     if (!key) return NO;
     @try {
         if ([gSeenHits containsObject:key]) return NO;
@@ -144,9 +104,9 @@ static UIViewController *DYTopVC(void) {
     } @catch (...) { return nil; }
 }
 
+/* ---------- 找原始 IMP ---------- */
 static IMP DYOrigFor(id self, SEL _cmd) {
     NSString *sel = NSStringFromSelector(_cmd);
-    /* 类方法：self 本身是 meta-class；实例方法：走继承链 */
     BOOL isMeta = class_isMetaClass(object_getClass(self));
     Class c = isMeta ? object_getClass(self) : [self class];
     while (c) {
@@ -159,25 +119,10 @@ static IMP DYOrigFor(id self, SEL _cmd) {
         c = class_getSuperclass(c);
     }
     IMP o2 = [gOrigBySel[sel] pointerValue];
-    if (o2) return o2;
-    return NULL;
+    return o2 ?: NULL;
 }
 
-/* ---------- 规范化 type encoding：去掉数字 ---------- */
-static NSString *DYSigOf(const char *enc) {
-    if (!enc) return @"";
-    NSMutableString *t = [NSMutableString string];
-    for (const char *p = enc; *p; p++) {
-        if (*p >= '0' && *p <= '9') continue;
-        /* 去掉引号内类名的引号内容噪声，只保留类型字符 */
-        if (*p == '"') continue;
-        [t appendFormat:@"%c", *p];
-    }
-    return t;
-}
-
-/* 统计 encoding 里业务对象参数个数（冒号后、跳过数字/引号，只数 '@'）。
- * 返回 -1 表示存在非对象参数（不安全）。 */
+/* ---------- ABI 校验：业务参数必须全是对象 ---------- */
 static int DYObjectArgCount(const char *enc) {
     if (!enc) return -1;
     const char *colon = strchr(enc, ':');
@@ -187,647 +132,208 @@ static int DYObjectArgCount(const char *enc) {
     for (const char *p = colon + 1; *p; p++) {
         if (*p == '"') { inQuote = !inQuote; continue; }
         if (inQuote) continue;
-        if (*p >= '0' && *p <= '9') continue;   /* offset 数字 */
-        if (*p == ':') continue;                /* 分隔符 */
-        if (*p == '@') { cnt++; continue; }     /* 一个业务对象参数 */
-        return -1;                              /* 非对象(i/l/q/f/d/B...) -> 不安全 */
+        if (*p >= '0' && *p <= '9') continue;
+        if (*p == ':') continue;
+        if (*p == '@') { cnt++; continue; }
+        return -1;   /* 标量/结构体 -> 放弃 hook */
     }
     return cnt;
 }
 
-/* ---------- 核心注入：给任意字典塞 text_extra type=21（数组 + JSON 字符串双写） ---------- */
-static NSArray *DYTextExtrasArray(void) {
-    NSUInteger endLen = (gLastContentUTF8Len > 0) ? (NSUInteger)gLastContentUTF8Len :
-                        ((gLastContentLen > 0) ? (NSUInteger)gLastContentLen : 14);
-    return @[ @{ @"start": @0, @"end": @(endLen), @"type": @21 } ];
+/* ---------- 只读 trampoline：记录 + 原样转发，绝不改对象 ---------- */
+#define DY_LOG_AND_CALL(idname, voidname, n) \
+static id idname(id self, SEL _cmd, id a1,id a2,id a3,id a4,id a5,id a6) { \
+    return DYROCore(self, _cmd, n, NO, a1,a2,a3,a4,a5,a6); \
+} \
+static void voidname(id self, SEL _cmd, id a1,id a2,id a3,id a4,id a5,id a6) { \
+    DYROCore(self, _cmd, n, YES, a1,a2,a3,a4,a5,a6); \
 }
 
-static NSString *DYTextExtrasJSON(void) {
-    @try {
-        NSData *d = [NSJSONSerialization dataWithJSONObject:DYTextExtrasArray() options:0 error:nil];
-        if (!d) return nil;
-        return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    } @catch (...) { return nil; }
-}
-
-/* 返回注入后的对象（可能是 mutableCopy 的新对象） */
-static id DYInjectBody(id obj, NSString *tag) {
-    @try {
-        if (!obj) return obj;
-        BOOL isDict = [obj isKindOfClass:[NSDictionary class]];
-        if (isDict) {
-            NSMutableDictionary *md = [obj isKindOfClass:[NSMutableDictionary class]] ? obj : [obj mutableCopy];
-            if (!md) return obj;
-            BOOL changed = NO;
-            for (id k in [md allKeys]) {
-                if (![k isKindOfClass:[NSString class]]) continue;
-                NSString *kl = [(NSString *)k lowercaseString];
-                if ([kl rangeOfString:@"textextra"].location == NSNotFound &&
-                    [kl rangeOfString:@"text_extra"].location == NSNotFound) continue;
-                id val = [md objectForKey:k];
-                DYAppend([NSString stringWithFormat:@"[BODY] %@ 现有键 %@ = %@", tag, k, DYSafeFull(val)]);
-                if ([val isKindOfClass:[NSArray class]]) {
-                    NSMutableArray *ma = [val mutableCopy];
-                    BOOL c2 = NO;
-                    for (NSUInteger i = 0; i < [ma count]; i++) {
-                        id e = [ma objectAtIndex:i];
-                        if ([e isKindOfClass:[NSDictionary class]] || [e isKindOfClass:[NSMutableDictionary class]]) {
-                            NSMutableDictionary *me = [e isKindOfClass:[NSMutableDictionary class]] ? e : [e mutableCopy];
-                            [me setObject:@21 forKey:@"type"];
-                            [ma replaceObjectAtIndex:i withObject:me];
-                            c2 = YES;
-                        }
-                    }
-                    if (c2) { [md setObject:ma forKey:k]; changed = YES; }
-                } else if ([val isKindOfClass:[NSString class]]) {
-                    /* 已是 JSON 字符串：重新生成 type=21 的 JSON */
-                    NSString *js = DYTextExtrasJSON();
-                    if (js) { [md setObject:js forKey:k]; changed = YES; }
-                }
-            }
-            /* 无论是否已有，都双写覆盖两种读法 */
-            NSArray *arr = DYTextExtrasArray();
-            NSString *js = DYTextExtrasJSON();
-            [md setObject:arr forKey:@"text_extra"];
-            if (js) [md setObject:js forKey:@"text_extra_json"];
-            [md setObject:arr forKey:@"textExtra"];
-            changed = YES;
-            if (changed) {
-                gBodyHitCount++;
-                DYAppend([NSString stringWithFormat:@"[INJECT-BODY #%ld] %@ 已注入 text_extra type=21 (数组+JSON双写, end=%ld)",
-                          (long)gBodyHitCount, tag, (long)gLastContentUTF8Len]);
-                DYFlushLog();
-            }
-            return md;
-        }
-        if ([obj isKindOfClass:[NSArray class]]) {
-            /* textExtras 数组参数：只改字典元素的 type。
-             * 【v12 止血】绝不 KVC 自定义对象(Swift/KMP)——会触发不可捕获的 EXC_BAD_ACCESS 崩溃。
-             * 数组里的 AWETextExtra 等 model 元素一律跳过，只处理纯 NSDictionary。 */
-            NSMutableArray *ma = [obj isKindOfClass:[NSMutableArray class]] ? obj : [obj mutableCopy];
-            BOOL c2 = NO;
-            for (NSUInteger i = 0; i < [ma count]; i++) {
-                id e = [ma objectAtIndex:i];
-                if ([e isKindOfClass:[NSDictionary class]] || [e isKindOfClass:[NSMutableDictionary class]]) {
-                    NSMutableDictionary *me = [e isKindOfClass:[NSMutableDictionary class]] ? e : [e mutableCopy];
-                    [me setObject:@21 forKey:@"type"];
-                    [ma replaceObjectAtIndex:i withObject:me];
-                    c2 = YES;
-                }
-                /* 非字典元素（自定义 model）跳过，不做任何 KVC */
-            }
-            if (c2) {
-                gBodyHitCount++;
-                DYAppend([NSString stringWithFormat:@"[INJECT-BODY #%ld] %@ textExtras 字典元素 type->21 (count=%lu)",
-                          (long)gBodyHitCount, tag, (unsigned long)[ma count]]);
-                DYFlushLog();
-                return ma;
-            }
-        }
-        /* 【v12 止血】自定义对象一律原样返回，绝不 valueForKey/setValue:forKey。
-         * 崩溃根因：对 Swift/KMP model 做 KVC 触发信号级崩溃，@try 抓不住。 */
-        return obj;
-    } @catch (NSException *e) {
-        DYAppend([NSString stringWithFormat:@"[INJECT-BODY] %@ 异常 %@ 放弃", tag, e.name]);
-        return obj;
-    }
-}
-
-/* ---------- body 层通用 trampoline（参数必须全是对象，签名已严格校验） ---------- */
-/* 0 业务参数，返回对象：@@:  e.g. publishCommentParamsForServer / getPenetrateParamsForServer */
-static id dy_body_0_o(id self, SEL _cmd) {
-    IMP orig = DYOrigFor(self, _cmd);
-    id r = nil;
-    if (orig) { @try { r = ((id(*)(id,SEL))orig)(self, _cmd); } @catch (...) {} }
+/* 统一核心：n = 业务参数个数；wantVoid = 原方法是否返回 void。
+ * 用同一个 C 函数按 n 分派调用原 IMP，避免多份宏拼接出错。 */
+static id DYROCore(id self, SEL _cmd, int n, BOOL wantVoid,
+                   id a1, id a2, id a3, id a4, id a5, id a6) {
     NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    id out = DYInjectBody(r, tag);
-    if (DYGate([NSString stringWithFormat:@"b0|%@", tag])) {
-        DYAppend([NSString stringWithFormat:@"[BODY-HIT-0O] %@ ret(before)=%@ ret(after)=%@", tag, DYSafeFull(r), DYSafeFull(out)]);
-        DYFlushLog();
+    id p[6] = { a1, a2, a3, a4, a5, a6 };
+
+    /* 组参数摘要（只读 description） */
+    NSMutableString *args = [NSMutableString string];
+    for (int i = 0; i < n; i++) {
+        [args appendFormat:@" arg%d=%@", i + 1, DYSafeFull(p[i])];
     }
-    return out;
-}
 
-/* 2 业务参数，返回对象：@@:@@ */
-static id dy_body_2_o(id self, SEL _cmd, id a, id b) {
     IMP orig = DYOrigFor(self, _cmd);
-    id r = nil;
-    if (orig) { @try { r = ((id(*)(id,SEL,id,id))orig)(self, _cmd, a, b); } @catch (...) {} }
-    NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    id a2 = DYInjectBody(a, [tag stringByAppendingString:@".arg1"]);
-    id b2 = DYInjectBody(b, [tag stringByAppendingString:@".arg2"]);
-    id out = DYInjectBody(r, [tag stringByAppendingString:@".ret"]);
-    /* 若注入改动了参数，需要重新调用一次 orig 用新参数——但可能重复副作用。
-       仅当原返回被改成功时直接用 out；参数改动只记录，避免重复发请求。 */
-    if (DYGate([NSString stringWithFormat:@"b2o|%@|%@|%@", tag, DYSafe(a), DYSafe(b)])) {
-        DYAppend([NSString stringWithFormat:@"[BODY-HIT-2O] %@ arg1=%@ arg2=%@ ret(before)=%@ ret(after)=%@",
-                  tag, DYSafeFull(a), DYSafeFull(b), DYSafeFull(r), DYSafeFull(out)]);
-        DYFlushLog();
-    }
-    (void)a2; (void)b2;
-    return out;
-}
-
-/* 2 业务参数，返回 void：v@:@@  e.g. publishCommentWithRequest:inputSnapshot: */
-static void dy_body_2_v(id self, SEL _cmd, id a, id b) {
-    NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    id a2 = DYInjectBody(a, [tag stringByAppendingString:@".arg1"]);
-    id b2 = DYInjectBody(b, [tag stringByAppendingString:@".arg2"]);
-    IMP orig = DYOrigFor(self, _cmd);
-    if (orig) { @try { ((void(*)(id,SEL,id,id))orig)(self, _cmd, a2, b2); } @catch (...) {} }
-    if (DYGate([NSString stringWithFormat:@"b2v|%@|%@|%@", tag, DYSafe(a), DYSafe(b)])) {
-        DYAppend([NSString stringWithFormat:@"[BODY-HIT-2V] %@ arg1=%@ arg2=%@ (已尝试注入参数)",
-                  tag, DYSafeFull(a), DYSafeFull(b)]);
-        DYFlushLog();
-    }
-}
-
-/* 5 业务参数，返回 void：v@:@@@@@  e.g. addCommentParams:generalModel:commentModel:textExtras:params: */
-static void dy_body_5_v(id self, SEL _cmd, id a, id b, id c, id d, id e) {
-    NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    /* d=textExtras 数组, e=params 字典（按方法名顺序：addCommentParams/generalModel/commentModel/textExtras/params） */
-    id d2 = DYInjectBody(d, [tag stringByAppendingString:@".textExtras"]);
-    id e2 = DYInjectBody(e, [tag stringByAppendingString:@".params"]);
-    IMP orig = DYOrigFor(self, _cmd);
-    if (orig) { @try { ((void(*)(id,SEL,id,id,id,id,id))orig)(self, _cmd, a, b, c, d2, e2); } @catch (...) {} }
-    if (DYGate([NSString stringWithFormat:@"b5v|%@|%@|%@", tag, DYSafe(d), DYSafe(e)])) {
-        DYAppend([NSString stringWithFormat:@"[BODY-HIT-5V] %@ addCommentParams=%@ textExtras(before)=%@ params(before)=%@",
-                  tag, DYSafeFull(a), DYSafeFull(d), DYSafeFull(e)]);
-        DYFlushLog();
-    }
-}
-
-/* 5 业务参数，返回对象：@@:@@@@@ */
-static id dy_body_5_o(id self, SEL _cmd, id a, id b, id c, id d, id e) {
-    NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    id d2 = DYInjectBody(d, [tag stringByAppendingString:@".textExtras"]);
-    id e2 = DYInjectBody(e, [tag stringByAppendingString:@".params"]);
-    IMP orig = DYOrigFor(self, _cmd);
-    id r = nil;
-    if (orig) { @try { r = ((id(*)(id,SEL,id,id,id,id,id))orig)(self, _cmd, a, b, c, d2, e2); } @catch (...) {} }
-    id out = DYInjectBody(r, [tag stringByAppendingString:@".ret"]);
-    if (DYGate([NSString stringWithFormat:@"b5o|%@|%@|%@", tag, DYSafe(d), DYSafe(e)])) {
-        DYAppend([NSString stringWithFormat:@"[BODY-HIT-5O] %@ textExtras=%@ params=%@ ret(before)=%@ ret(after)=%@",
-                  tag, DYSafeFull(d), DYSafeFull(e), DYSafeFull(r), DYSafeFull(out)]);
-        DYFlushLog();
-    }
-    return out;
-}
-
-/* ---------- 通用 n 对象参数 trampoline（n=1/3/4/6，宏生成，避免遗漏未知签名） ---------- */
-#define DY_DEF_BODY_GN(n, ret) \
-static ret dy_body_g##n##_o(id self, SEL _cmd, \
-    id a1,id a2,id a3,id a4,id a5,id a6) { \
-    NSString *tag=[NSString stringWithFormat:@"%@|%@",NSStringFromClass([self class]),NSStringFromSelector(_cmd)]; \
-    id p[6]={a1,a2,a3,a4,a5,a6}; \
-    for(int i=0;i<n;i++){ id inj=DYInjectBody(p[i],[[tag stringByAppendingFormat:@".arg%d",i+1] copy]); if(inj)p[i]=inj; } \
-    IMP orig=DYOrigFor(self,_cmd); \
-    ret r##n; memset(&r##n,0,sizeof(r##n)); \
-    if(orig){ @try{ \
-        if(n==1) r##n=(ret)((ret(*)(id,SEL,id))orig)(self,_cmd,p[0]); \
-        else if(n==3) r##n=(ret)((ret(*)(id,SEL,id,id,id))orig)(self,_cmd,p[0],p[1],p[2]); \
-        else if(n==4) r##n=(ret)((ret(*)(id,SEL,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3]); \
-        else if(n==6) r##n=(ret)((ret(*)(id,SEL,id,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4],p[5]); \
-    }@catch(...){} } \
-    if(DYGate([NSString stringWithFormat:@"gn%d|O|%@",n,tag])){ \
-        DYAppend([NSString stringWithFormat:@"[BODY-HIT-G%dO] %@ (已尝试注入%d个对象参数)",n,tag,n]); \
-        DYFlushLog(); \
-    } \
-    return r##n; \
-}
-/* void 版本不能 return 值；单独用 void 展开 */
-DY_DEF_BODY_GN(1, id)
-DY_DEF_BODY_GN(3, id)
-DY_DEF_BODY_GN(4, id)
-DY_DEF_BODY_GN(6, id)
-
-/* 上面宏对 ret=id 生成 `id r;` 合法；void 版本单独写 */
-static void dy_body_g1_v(id self, SEL _cmd, id a1,id a2,id a3,id a4,id a5,id a6){
-    NSString *tag=[NSString stringWithFormat:@"%@|%@",NSStringFromClass([self class]),NSStringFromSelector(_cmd)];
-    id inj=DYInjectBody(a1,[tag stringByAppendingString:@".arg1"]); if(!inj)inj=a1;
-    IMP orig=DYOrigFor(self,_cmd); if(orig){@try{((void(*)(id,SEL,id))orig)(self,_cmd,inj);}@catch(...){}}
-    if(DYGate([NSString stringWithFormat:@"gn1v|%@",tag])){DYAppend([NSString stringWithFormat:@"[BODY-HIT-G1V] %@",tag]);DYFlushLog();}
-}
-static void dy_body_g3_v(id self, SEL _cmd, id a1,id a2,id a3,id a4,id a5,id a6){
-    NSString *tag=[NSString stringWithFormat:@"%@|%@",NSStringFromClass([self class]),NSStringFromSelector(_cmd)];
-    id p[3]={a1,a2,a3}; for(int i=0;i<3;i++){id x=DYInjectBody(p[i],[[tag stringByAppendingFormat:@".arg%d",i+1] copy]);if(x)p[i]=x;}
-    IMP orig=DYOrigFor(self,_cmd); if(orig){@try{((void(*)(id,SEL,id,id,id))orig)(self,_cmd,p[0],p[1],p[2]);}@catch(...){}}
-    if(DYGate([NSString stringWithFormat:@"gn3v|%@",tag])){DYAppend([NSString stringWithFormat:@"[BODY-HIT-G3V] %@",tag]);DYFlushLog();}
-}
-static void dy_body_g4_v(id self, SEL _cmd, id a1,id a2,id a3,id a4,id a5,id a6){
-    NSString *tag=[NSString stringWithFormat:@"%@|%@",NSStringFromClass([self class]),NSStringFromSelector(_cmd)];
-    id p[4]={a1,a2,a3,a4}; for(int i=0;i<4;i++){id x=DYInjectBody(p[i],[[tag stringByAppendingFormat:@".arg%d",i+1] copy]);if(x)p[i]=x;}
-    IMP orig=DYOrigFor(self,_cmd); if(orig){@try{((void(*)(id,SEL,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3]);}@catch(...){}}
-    if(DYGate([NSString stringWithFormat:@"gn4v|%@",tag])){DYAppend([NSString stringWithFormat:@"[BODY-HIT-G4V] %@",tag]);DYFlushLog();}
-}
-static void dy_body_g6_v(id self, SEL _cmd, id a1,id a2,id a3,id a4,id a5,id a6){
-    NSString *tag=[NSString stringWithFormat:@"%@|%@",NSStringFromClass([self class]),NSStringFromSelector(_cmd)];
-    id p[6]={a1,a2,a3,a4,a5,a6}; for(int i=0;i<6;i++){id x=DYInjectBody(p[i],[[tag stringByAppendingFormat:@".arg%d",i+1] copy]);if(x)p[i]=x;}
-    IMP orig=DYOrigFor(self,_cmd); if(orig){@try{((void(*)(id,SEL,id,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4],p[5]);}@catch(...){}}
-    if(DYGate([NSString stringWithFormat:@"gn6v|%@",tag])){DYAppend([NSString stringWithFormat:@"[BODY-HIT-G6V] %@",tag]);DYFlushLog();}
-}
-
-/* 【v12 新增】addCommentParams 专用 trampoline
- * 真实签名(41.0.0 日志实锤)：@56@0:8q16@24@32@40@48
- * 即：返回对象；参数1=long long(q)，随后 4 个对象：generalModel/commentModel/textExtras/params
- * ABI 关键：第 1 个业务参数是 64 位标量 q，必须按 long long 接收，不能当 id！ */
-static id dy_body_addCommentParams(id self, SEL _cmd, long long p1, id o2, id o3, id o4, id o5) {
-    NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    /* o4=textExtras 数组, o5=params 字典（按 selector 段序，最后一个 textExtras:/params:） */
-    id o4n = DYInjectBody(o4, [tag stringByAppendingString:@".textExtras"]);
-    id o5n = DYInjectBody(o5, [tag stringByAppendingString:@".params"]);
-    IMP orig = DYOrigFor(self, _cmd);
-    id r = nil;
+    id retObj = nil;
     if (orig) {
         @try {
-            r = ((id(*)(id,SEL,long long,id,id,id,id))orig)(self, _cmd, p1, o2, o3, o4n, o5n);
-        } @catch (...) {}
-    }
-    id out = DYInjectBody(r, [tag stringByAppendingString:@".ret"]);
-    DYAppend([NSString stringWithFormat:@"[BODY-HIT-ADDPARAMS] %@ p1=%lld o4(textExtras)=%@ o5(params)=%@ ret=%@",
-              tag, p1, DYSafeFull(o4), DYSafeFull(o5), DYSafeFull(r)]);
-    DYFlushLog();
-    return out;
-}
-
-/* ---------- setType: 只读对照 ---------- */
-static int DYSetTypeArgKind(const char *enc) {
-    if (!enc) return 0;
-    const char *colon = strchr(enc, ':');
-    if (!colon) return 0;
-    for (const char *p = colon + 1; *p; p++) {
-        if (*p >= '0' && *p <= '9') continue;
-        if (*p == '@') return 2;
-        if (*p=='i'||*p=='l'||*p=='q'||*p=='I'||*p=='L'||*p=='Q') return 1;
-        if (*p=='"') break;
-    }
-    return 0;
-}
-
-static void dy_setType_int(id self, SEL _cmd, long long v) {
-    @try {
-        gSetTypeCalls++;
-        if (gSetTypeCalls <= 8 || gSetTypeCalls % 20 == 0) {
-            DYAppend([NSString stringWithFormat:@"[SET-TYPE #%ld] 原值=%lld on %@ (只读)",
-                      (long)gSetTypeCalls, v, NSStringFromClass([self class])]);
-            DYFlushLog();
-        }
-    } @catch (...) {}
-    if (gOrigSetType && gOrigSetType != (IMP)dy_setType_int) {
-        @try { ((void(*)(id,SEL,long long))gOrigSetType)(self, _cmd, v); } @catch (...) {}
-    }
-}
-
-static void dy_setType_obj(id self, SEL _cmd, id v) {
-    @try {
-        gSetTypeCalls++;
-        if (gSetTypeCalls <= 8 || gSetTypeCalls % 20 == 0) {
-            DYAppend([NSString stringWithFormat:@"[SET-TYPE #%ld] 原值=%@ on %@ (只读)",
-                      (long)gSetTypeCalls, DYSafe(v), NSStringFromClass([self class])]);
-            DYFlushLog();
-        }
-    } @catch (...) {}
-    if (gOrigSetType && gOrigSetType != (IMP)dy_setType_obj) {
-        @try { ((void(*)(id,SEL,id))gOrigSetType)(self, _cmd, v); } @catch (...) {}
-    }
-}
-
-/* ---------- 通用只读 dump trampoline（model 层兜底对照） ---------- */
-static void dy_dump_void0(id self, SEL _cmd) {
-    IMP orig = DYOrigFor(self, _cmd);
-    if (orig) { @try { ((void(*)(id,SEL))orig)(self, _cmd); } @catch (...) {} }
-    NSString *cn = NSStringFromClass([self class]);
-    NSString *sn = NSStringFromSelector(_cmd);
-    if (DYGate([NSString stringWithFormat:@"v0|%@|%@", cn, sn])) {
-        DYAppend([NSString stringWithFormat:@"[HIT] void %@ on %@", sn, cn]);
-        DYFlushLog();
-    }
-}
-
-static void dy_dump_void1(id self, SEL _cmd, id arg) {
-    if ([NSStringFromSelector(_cmd) isEqualToString:@"setContent:"] && [arg isKindOfClass:[NSString class]]) {
-        gLastContentLen = [(NSString *)arg length];
-        gLastContentUTF8Len = (NSInteger)strlen([(NSString *)arg UTF8String]);
-    }
-    IMP orig = DYOrigFor(self, _cmd);
-    if (orig) { @try { ((void(*)(id,SEL,id))orig)(self, _cmd, arg); } @catch (...) {} }
-    NSString *cn = NSStringFromClass([self class]);
-    NSString *sn = NSStringFromSelector(_cmd);
-    if (DYGate([NSString stringWithFormat:@"v1|%@|%@|%@", cn, sn, DYSafe(arg)])) {
-        DYAppend([NSString stringWithFormat:@"[HIT] void %@ on %@ arg=%@", sn, cn, DYSafe(arg)]);
-        DYFlushLog();
-    }
-}
-
-static id dy_dump_obj0(id self, SEL _cmd) {
-    IMP orig = DYOrigFor(self, _cmd);
-    id r = nil;
-    if (orig) { @try { r = ((id(*)(id,SEL))orig)(self, _cmd); } @catch (...) {} }
-    NSString *cn = NSStringFromClass([self class]);
-    NSString *sn = NSStringFromSelector(_cmd);
-    if (DYGate([NSString stringWithFormat:@"o0|%@|%@|%@", cn, sn, DYSafe(r)])) {
-        DYAppend([NSString stringWithFormat:@"[HIT] ret %@ on %@ = %@", sn, cn, DYSafe(r)]);
-        DYFlushLog();
-    }
-    return r;
-}
-
-static id dy_dump_obj1(id self, SEL _cmd, id arg) {
-    IMP orig = DYOrigFor(self, _cmd);
-    id r = nil;
-    if (orig) { @try { r = ((id(*)(id,SEL,id))orig)(self, _cmd, arg); } @catch (...) {} }
-    NSString *cn = NSStringFromClass([self class]);
-    NSString *sn = NSStringFromSelector(_cmd);
-    if (DYGate([NSString stringWithFormat:@"o1|%@|%@|%@|%@", cn, sn, DYSafe(arg), DYSafe(r)])) {
-        DYAppend([NSString stringWithFormat:@"[HIT] %@ on %@ arg=%@ ret=%@", sn, cn, DYSafe(arg), DYSafe(r)]);
-        DYFlushLog();
-    }
-    return r;
-}
-
-/* ---------- model 层兜底注入（保留，值=21） ---------- */
-static id DYInjectBodyAsExtraParams(id params, NSString *tag) {
-    @try {
-        if (!params) return params;
-        if (!([params isKindOfClass:[NSDictionary class]])) return params;
-        NSMutableDictionary *md = [params isKindOfClass:[NSMutableDictionary class]] ? params : [params mutableCopy];
-        NSArray *arr = DYTextExtrasArray();
-        NSString *js = DYTextExtrasJSON();
-        [md setObject:arr forKey:@"text_extra"];
-        [md setObject:arr forKey:@"textExtra"];
-        if (js) [md setObject:js forKey:@"text_extra_json"];
-        for (id k in [md allKeys]) {
-            if (![k isKindOfClass:[NSString class]]) continue;
-            id val = [md objectForKey:k];
-            if ([val isKindOfClass:[NSArray class]]) {
-                NSMutableArray *ma = [val mutableCopy];
-                for (NSUInteger i = 0; i < [ma count]; i++) {
-                    id ee = [ma objectAtIndex:i];
-                    if ([ee isKindOfClass:[NSDictionary class]] || [ee isKindOfClass:[NSMutableDictionary class]]) {
-                        NSMutableDictionary *me = [ee isKindOfClass:[NSMutableDictionary class]] ? ee : [ee mutableCopy];
-                        if ([[me allKeys] containsObject:@"type"]) { [me setObject:@21 forKey:@"type"]; [ma replaceObjectAtIndex:i withObject:me]; }
-                    }
-                }
-                [md setObject:ma forKey:k];
+            if (wantVoid) {
+                if      (n==0) ((void(*)(id,SEL))orig)(self,_cmd);
+                else if (n==1) ((void(*)(id,SEL,id))orig)(self,_cmd,p[0]);
+                else if (n==2) ((void(*)(id,SEL,id,id))orig)(self,_cmd,p[0],p[1]);
+                else if (n==3) ((void(*)(id,SEL,id,id,id))orig)(self,_cmd,p[0],p[1],p[2]);
+                else if (n==4) ((void(*)(id,SEL,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3]);
+                else if (n==5) ((void(*)(id,SEL,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4]);
+                else if (n==6) ((void(*)(id,SEL,id,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4],p[5]);
+            } else {
+                if      (n==0) retObj = ((id(*)(id,SEL))orig)(self,_cmd);
+                else if (n==1) retObj = ((id(*)(id,SEL,id))orig)(self,_cmd,p[0]);
+                else if (n==2) retObj = ((id(*)(id,SEL,id,id))orig)(self,_cmd,p[0],p[1]);
+                else if (n==3) retObj = ((id(*)(id,SEL,id,id,id))orig)(self,_cmd,p[0],p[1],p[2]);
+                else if (n==4) retObj = ((id(*)(id,SEL,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3]);
+                else if (n==5) retObj = ((id(*)(id,SEL,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4]);
+                else if (n==6) retObj = ((id(*)(id,SEL,id,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4],p[5]);
             }
+        } @catch (NSException *e) {
+            DYAppend([NSString stringWithFormat:@"[RO] orig 抛异常 %@ on %@", e.name, tag]);
         }
-        return md;
-    } @catch (...) { return params; }
+    }
+
+    NSString *dkey = [NSString stringWithFormat:@"ro%d|%@|%@", n, tag, [args substringToIndex:MIN((NSUInteger)80, args.length)]];
+    if (DYGate(dkey)) {
+        if (wantVoid) {
+            DYAppend([NSString stringWithFormat:@"[RO-v] %@%@", tag, args]);
+        } else {
+            DYAppend([NSString stringWithFormat:@"[RO-o] %@%@ ret=%@", tag, args, DYSafeFull(retObj)]);
+        }
+    }
+    return retObj;
 }
 
-static id dy_extraParams_get(id self, SEL _cmd) {
+/* 为 n=0..6 生成包装函数（名字由宏拼接，唯一；引用见 DYTrampFor 集中数组） */
+DY_LOG_AND_CALL(dy_ro_id_0,  dy_ro_void_0,  0)
+DY_LOG_AND_CALL(dy_ro_id_1,  dy_ro_void_1,  1)
+DY_LOG_AND_CALL(dy_ro_id_2,  dy_ro_void_2,  2)
+DY_LOG_AND_CALL(dy_ro_id_3,  dy_ro_void_3,  3)
+DY_LOG_AND_CALL(dy_ro_id_4,  dy_ro_void_4,  4)
+DY_LOG_AND_CALL(dy_ro_id_5,  dy_ro_void_5,  5)
+DY_LOG_AND_CALL(dy_ro_id_6,  dy_ro_void_6,  6)
+
+/* addCommentParams 专用：真实签名 @@:q@@@@（首业务参数 64 位标量 q） */
+static id dy_ro_addCommentParams(id self, SEL _cmd, long long p1, id o2, id o3, id o4, id o5) {
+    NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
     IMP orig = DYOrigFor(self, _cmd);
     id r = nil;
-    if (orig) { @try { r = ((id(*)(id,SEL))orig)(self, _cmd); } @catch (...) {} }
-    return DYInjectBodyAsExtraParams(r, @"extraParams(get)");
-}
-
-static void dy_setExtraParams(id self, SEL _cmd, id arg) {
-    id mutated = DYInjectBodyAsExtraParams(arg, @"setExtraParams:");
-    IMP orig = DYOrigFor(self, _cmd);
-    if (orig) { @try { ((void(*)(id,SEL,id))orig)(self, _cmd, mutated); } @catch (...) {} }
-}
-
-/* 【v12】model 层改为纯只读对照：
- * 旧版在这里用原始 setType 或 KVC 改 AWETextExtra.type，v9 已证伪「只喂本地渲染、服务端不认」，
- * 且 KVC(setValue:forKey:) 对 Swift/KMP 对象触发过不可捕获的崩溃。v12 一律不写，只 dump。 */
-static void DYMutateExtraInfo(id arr) {
-    @try {
-        if (!arr || ![arr isKindOfClass:[NSArray class]]) return;
-        for (id e in (NSArray *)arr) {
-            @try {
-                if ([NSStringFromClass([e class]) isEqualToString:@"AWETextExtra"]) {
-                    if (DYGate([@"extrainfo-ro|" stringByAppendingString:DYSafe(e)])) {
-                        DYAppend([NSString stringWithFormat:@"[EXTRAINFO-RO] %@ (只读,未改写)", DYSafe(e)]);
-                    }
-                }
-            } @catch (...) {}
-        }
-    } @catch (...) {}
-}
-
-static void dy_setExtraInfo(id self, SEL _cmd, id arg) {
-    DYMutateExtraInfo(arg);
-    IMP orig = DYOrigFor(self, _cmd);
-    if (orig) { @try { ((void(*)(id,SEL,id))orig)(self, _cmd, arg); } @catch (...) {} }
-}
-
-static id dy_extraInfo_get(id self, SEL _cmd) {
-    IMP orig = DYOrigFor(self, _cmd);
-    id r = nil;
-    if (orig) { @try { r = ((id(*)(id,SEL))orig)(self, _cmd); } @catch (...) {} }
-    DYMutateExtraInfo(r);
+    if (orig) { @try { r = ((id(*)(id,SEL,long long,id,id,id,id))orig)(self,_cmd,p1,o2,o3,o4,o5); } @catch (...) {} }
+    if (DYGate([@"ro-add|" stringByAppendingString:tag])) {
+        DYAppend([NSString stringWithFormat:@"[RO-ADDPARAMS] %@ p1=%lld o2=%@ o3=%@ o4=%@ o5=%@ ret=%@",
+                  tag, p1, DYSafeFull(o2), DYSafeFull(o3), DYSafeFull(o4), DYSafeFull(o5), DYSafeFull(r)]);
+    }
     return r;
 }
 
-/* ---------- hook 安装 ---------- */
-static void DYInstallSetTypeHook(void) {
-    if (gOrigSetType || gHookUnsupported) return;
-    @try {
-        Class ec = objc_getClass("AWETextExtra");
-        if (!ec) return;
-        Method m = class_getInstanceMethod(ec, @selector(setType:));
-        if (!m) return;
-        const char *enc = method_getTypeEncoding(m);
-        int kind = DYSetTypeArgKind(enc);
-        if (kind == 1) gOrigSetType = method_setImplementation(m, (IMP)dy_setType_int);
-        else if (kind == 2) gOrigSetType = method_setImplementation(m, (IMP)dy_setType_obj);
-        else gHookUnsupported = YES;
-    } @catch (...) {}
+/* 集中引用所有 trampoline，便于核对定义-引用一致 */
+static IMP DYTrampFor(int n, BOOL retVoid) {
+    if (n < 0 || n > 6) return NULL;
+    if (retVoid) {
+        IMP t[7] = { (IMP)dy_ro_void_0, (IMP)dy_ro_void_1, (IMP)dy_ro_void_2, (IMP)dy_ro_void_3,
+                     (IMP)dy_ro_void_4, (IMP)dy_ro_void_5, (IMP)dy_ro_void_6 };
+        return t[n];
+    }
+    IMP t[7] = { (IMP)dy_ro_id_0, (IMP)dy_ro_id_1, (IMP)dy_ro_id_2, (IMP)dy_ro_id_3,
+                 (IMP)dy_ro_id_4, (IMP)dy_ro_id_5, (IMP)dy_ro_id_6 };
+    return t[n];
 }
 
-/* 目标 body 层 selector -> 期望参数个数 */
-typedef struct { const char *sel; int nargs; } DYBizSel;
-static const DYBizSel kBizSels[] = {
-    { "publishCommentParamsForServer", 0 },
-    { "commentParamsWithModel:refer:", 2 },
-    { "publishCommentWithRequest:inputSnapshot:", 2 },
-    { "commentPublishRequestWithSnapshot:refer:", 2 },
-    /* 【v12】保留 addCommentParams（专用 trampoline 处理）；移除 submitTextExtras(个性签名/分享)
-     * 与 getPenetrateParamsForServer(电商搜索)——它们与评论无关，却在无关场景触发注入噪声。 */
-    { "addCommentParams:generalModel:commentModel:textExtras:params:", 5 },
-};
+/* ---------- 命中关键词筛选 ---------- */
+static BOOL DYInterestingSEL(NSString *sn) {
+    if (!sn) return NO;
+    NSString *s = [sn lowercaseString];
+    NSArray *kw = @[
+        @"comment", @"publish", @"textextra", @"text_extra",
+        @"requestparams", @"requestmodel", @"commonrequestforpost",
+        @"buildrequestparams", @"datawithrequestmodel", @"bodyp",
+        @"setbody", @"extraparams", @"penetrate", @"inputsnapshot"
+    ];
+    for (NSString *k in kw) if ([s rangeOfString:k].location != NSNotFound) return YES;
+    return NO;
+}
 
-/* 根据 selector 名 + 签名选择 trampoline；NULL 表示不匹配（放弃，防崩）
- * ABI 安全：业务参数必须全是对象、返回值必须是 @(对象) 或 v(void)，否则不 hook。 */
 static IMP DYPickTrampoline(SEL sel, const char *enc) {
     if (!enc) return NULL;
-    /* 【v12】addCommentParams 专用：签名 @@:q@@@@ (返回对象 + long long + 4对象)。
-     * 必须在全对象校验前拦截，因为 q 会被 DYObjectArgCount 判 -1 跳过。 */
-    NSString *sn0 = NSStringFromSelector(sel);
-    if ([sn0 isEqualToString:@"addCommentParams:generalModel:commentModel:textExtras:params:"]) {
-        NSString *sig0 = DYSigOf(enc);
-        if ([sig0 isEqualToString:@"@@:q@@@@"]) return (IMP)dy_body_addCommentParams;
-        DYAppend([NSString stringWithFormat:@"[HOOK-BODY] ⚠addCommentParams 签名非预期 %@ (需@@:q@@@@) 放弃", sig0]);
+    NSString *sn = NSStringFromSelector(sel);
+    /* addCommentParams 专用签名优先 */
+    if ([sn isEqualToString:@"addCommentParams:generalModel:commentModel:textExtras:params:"]) {
+        /* 允许 @@:q@@@@ (DYSigOf 后) */
+        NSMutableString *sig = [NSMutableString string];
+        for (const char *q = enc; *q; q++) {
+            if (*q >= '0' && *q <= '9') continue;
+            [sig appendFormat:@"%c", *q];
+        }
+        if ([sig isEqualToString:@"@@:q@@@@"]) return (IMP)dy_ro_addCommentParams;
+        DYAppend([NSString stringWithFormat:@"[PICK] addCommentParams 签名非预期 %@ 放弃", sig]);
         return NULL;
     }
     char ret = enc[0];
     BOOL retVoid = (ret == 'v');
     BOOL retObj  = (ret == '@');
-    if (!retVoid && !retObj) return NULL;   /* 返回BOOL/标量/结构体 -> 跳过，避免 ABI 错位闪退 */
+    if (!retVoid && !retObj) return NULL;
     int objArgs = DYObjectArgCount(enc);
-    if (objArgs < 0) return NULL;           /* 存在非对象参数 -> 跳过 */
-    NSString *sn = NSStringFromSelector(sel);
+    if (objArgs < 0) return NULL;
     NSUInteger colonCount = [[sn componentsSeparatedByString:@":"] count] - 1;
-    /* 对象参数个数必须与冒数一致，否则签名不符 -> 跳过（双保险） */
-    if (objArgs != (int)colonCount) return NULL;
-    if (colonCount == 0) {
-        return retObj ? (IMP)dy_body_0_o : NULL;   /* 0 参数必须返回对象才 hook */
-    }
-    if (colonCount == 2) {
-        return retVoid ? (IMP)dy_body_2_v : (IMP)dy_body_2_o;
-    }
-    if (colonCount == 5) {
-        return retVoid ? (IMP)dy_body_5_v : (IMP)dy_body_5_o;
-    }
-    /* 其它参数个数：1/3/4/6 对象参数，用通用 trampoline 兜住 */
-    if (colonCount == 1) return retVoid ? (IMP)dy_body_g1_v : (IMP)dy_body_g1_o;
-    if (colonCount == 3) return retVoid ? (IMP)dy_body_g3_v : (IMP)dy_body_g3_o;
-    if (colonCount == 4) return retVoid ? (IMP)dy_body_g4_v : (IMP)dy_body_g4_o;
-    if (colonCount == 6) return retVoid ? (IMP)dy_body_g6_v : (IMP)dy_body_g6_o;
-    return NULL;
+    if (objArgs != (int)colonCount) return NULL;   /* 双保险 */
+    if (colonCount == 0 && !retObj) return NULL;    /* 0 参数 void 无意义 */
+    return DYTrampFor((int)colonCount, retVoid);
 }
 
-/* 扫描一个 method list，命中目标 selector 则 hook。isClassMethod 仅用于日志区分。 */
-static int DYScanMethodList(Method *ml, unsigned int mc, Class cls, NSString *clsName, BOOL isClassMethod) {
+/* ---------- 扫描安装 ---------- */
+static int DYScanList(Method *ml, unsigned int mc, NSString *clsName, BOOL isClassMethod) {
     int hit = 0;
     @try {
         for (unsigned int j = 0; j < mc; j++) {
             SEL sel = method_getName(ml[j]);
             NSString *sn = NSStringFromSelector(sel);
-            BOOL target = NO;
-            for (unsigned int k = 0; k < sizeof(kBizSels)/sizeof(kBizSels[0]); k++) {
-                if ([sn isEqualToString:[NSString stringWithUTF8String:kBizSels[k].sel]]) { target = YES; break; }
-            }
-            if (!target) continue;
+            if (!DYInterestingSEL(sn)) continue;
             NSString *key = [NSString stringWithFormat:@"%@%@|%@", isClassMethod ? @"+" : @"-", clsName, sn];
             if ([gHookedKeys containsObject:key]) continue;
             const char *enc = method_getTypeEncoding(ml[j]);
             IMP tramp = DYPickTrampoline(sel, enc);
-            if (!tramp) {
-                /* 不静默跳过：把真实签名打出来，便于一次反馈精确修正 */
-                DYAppend([NSString stringWithFormat:@"[HOOK-BODY] ⚠签名不匹配 %@ enc=%s (ret=%c)", key, enc ? enc : "?", enc ? enc[0] : '?']);
-                DYFlushLog();
-                continue;
-            }
+            if (!tramp) continue;
             IMP orig = method_setImplementation(ml[j], tramp);
             if (orig) {
                 gOrigByHook[key] = [NSValue valueWithPointer:orig];
                 gOrigBySel[sn] = [NSValue valueWithPointer:orig];
                 [gHookedKeys addObject:key];
                 hit++;
-                DYAppend([NSString stringWithFormat:@"[HOOK-BODY] ✅ %@ enc=%s -> 已挂", key, enc ? enc : "?"]);
-                DYFlushLog();
             }
         }
     } @catch (NSException *e) {
-        DYAppend([NSString stringWithFormat:@"[HOOK-BODY] 扫描异常 %@", e.name]);
+        DYAppend([NSString stringWithFormat:@"[SCAN] 异常 %@", e.name]);
     }
     return hit;
 }
 
-/* 运行时全类扫描：实例方法 + 类方法都扫（目标可能是类方法） */
-static void DYHookBodyLayer(void) {
+static void DYHookAll(void) {
     unsigned int cc = 0;
     Class *classes = objc_copyClassList(&cc);
-    int hit = 0;
+    int total = 0;
     @try {
         for (unsigned int i = 0; i < cc; i++) {
             Class cls = classes[i];
-            NSString *clsName = NSStringFromClass(cls);
-            /* 实例方法 */
+            NSString *cn = NSStringFromClass(cls);
             unsigned int mc = 0;
             Method *ml = class_copyMethodList(cls, &mc);
-            if (ml) { hit += DYScanMethodList(ml, mc, cls, clsName, NO); free(ml); }
-            /* 类方法（meta-class） */
+            if (ml) { total += DYScanList(ml, mc, cn, NO); free(ml); }
             Class meta = object_getClass(cls);
             if (meta) {
                 unsigned int cmc = 0;
                 Method *cml = class_copyMethodList(meta, &cmc);
-                if (cml) { hit += DYScanMethodList(cml, cmc, meta, clsName, YES); free(cml); }
+                if (cml) { total += DYScanList(cml, cmc, cn, YES); free(cml); }
             }
         }
     } @catch (NSException *e) {
-        DYAppend([NSString stringWithFormat:@"[HOOK-BODY] 异常 %@", e.name]);
+        DYAppend([NSString stringWithFormat:@"[HOOK] 全类扫描异常 %@", e.name]);
     }
     free(classes);
-    DYAppend([NSString stringWithFormat:@"[HOOK-BODY] body 层共挂 %d 个方法", hit]);
-    DYFlushLog();
+    DYAppend([NSString stringWithFormat:@"[HOOK] 只读探针共挂 %d 个方法", total]);
 }
 
-/* model 层兜底 hook */
-static void DYHookModelFallback(void) {
-    int total = 0;
+static void DYCopyLog(void) {
     @try {
-        NSArray *names = @[@"AWECommentPublishParameterModel", @"AWECommentInputContentModel"];
-        for (NSString *nm in names) {
-            Class cls = NSClassFromString(nm);
-            if (!cls) continue;
-            unsigned int mc = 0; Method *ml = class_copyMethodList(cls, &mc);
-            for (unsigned int j = 0; j < mc; j++) {
-                SEL sel = method_getName(ml[j]);
-                NSString *sn = NSStringFromSelector(sel);
-                NSString *key = [NSString stringWithFormat:@"%@|%@", nm, sn];
-                if ([gHookedKeys containsObject:key]) continue;
-                const char *enc = method_getTypeEncoding(ml[j]);
-                NSString *sig = DYSigOf(enc);
-                IMP orig = NULL;
-                if ([sn isEqualToString:@"extraParams"] && [sig isEqualToString:@"@@:"]) orig = method_setImplementation(ml[j], (IMP)dy_extraParams_get);
-                else if ([sn isEqualToString:@"setExtraParams:"] && [sig isEqualToString:@"v@:@"]) orig = method_setImplementation(ml[j], (IMP)dy_setExtraParams);
-                else if ([sn isEqualToString:@"setExtraInfo:"] && [sig isEqualToString:@"v@:@"]) orig = method_setImplementation(ml[j], (IMP)dy_setExtraInfo);
-                else if ([sn isEqualToString:@"extraInfo"] && [sig isEqualToString:@"@@:"]) orig = method_setImplementation(ml[j], (IMP)dy_extraInfo_get);
-                else if ([sig isEqualToString:@"v@:"]) orig = method_setImplementation(ml[j], (IMP)dy_dump_void0);
-                else if ([sig isEqualToString:@"v@:@"]) orig = method_setImplementation(ml[j], (IMP)dy_dump_void1);
-                else if ([sig isEqualToString:@"@@:"]) orig = method_setImplementation(ml[j], (IMP)dy_dump_obj0);
-                else if ([sig isEqualToString:@"@@:@"]) orig = method_setImplementation(ml[j], (IMP)dy_dump_obj1);
-                if (orig) {
-                    gOrigByHook[key] = [NSValue valueWithPointer:orig];
-                    gOrigBySel[sn] = [NSValue valueWithPointer:orig];
-                    [gHookedKeys addObject:key];
-                    total++;
-                }
-            }
-            free(ml);
-        }
-        /* setExtraInfo 的 AWETextExtra 改写用原始 setType */
-        Class tc = NSClassFromString(@"AWETextExtra");
-        if (tc) {
-            unsigned int mc = 0; Method *ml = class_copyMethodList(tc, &mc);
-            for (unsigned int j = 0; j < mc; j++) {
-                SEL sel = method_getName(ml[j]);
-                NSString *sn = NSStringFromSelector(sel);
-                NSString *key = [NSString stringWithFormat:@"AWETextExtra|%@", sn];
-                if ([gHookedKeys containsObject:key]) continue;
-                const char *enc = method_getTypeEncoding(ml[j]);
-                NSString *sig = DYSigOf(enc);
-                IMP orig = NULL;
-                if ([sn isEqualToString:@"setExtraInfo:"] && [sig isEqualToString:@"v@:@"]) orig = method_setImplementation(ml[j], (IMP)dy_setExtraInfo);
-                else if ([sig isEqualToString:@"v@:"]) orig = method_setImplementation(ml[j], (IMP)dy_dump_void0);
-                else if ([sig isEqualToString:@"v@:@"]) orig = method_setImplementation(ml[j], (IMP)dy_dump_void1);
-                else if ([sig isEqualToString:@"@@:"]) orig = method_setImplementation(ml[j], (IMP)dy_dump_obj0);
-                else if ([sig isEqualToString:@"@@:@"]) orig = method_setImplementation(ml[j], (IMP)dy_dump_obj1);
-                if (orig) {
-                    gOrigByHook[key] = [NSValue valueWithPointer:orig];
-                    gOrigBySel[sn] = [NSValue valueWithPointer:orig];
-                    [gHookedKeys addObject:key];
-                    total++;
-                }
-            }
-            free(ml);
-        }
-    } @catch (NSException *e) {
-        DYAppend([NSString stringWithFormat:@"[HOOK-MODEL] 异常 %@", e.name]);
-    }
-    DYAppend([NSString stringWithFormat:@"[HOOK-MODEL] model 兜底共挂 %d 个方法", total]);
-    DYFlushLog();
-}
-
-static void DYStartPolling(void) {
-    @try {
-        gPollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
-            @autoreleasepool { DYInstallSetTypeHook(); }
-        }];
-        if (gPollTimer) [[NSRunLoop mainRunLoop] addTimer:gPollTimer forMode:NSRunLoopCommonModes];
+        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        NSString *path = [doc stringByAppendingPathComponent:@"dyprobe_dump.txt"];
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        if (pb) pb.string = (txt ?: gBuf ?: @"");
     } @catch (...) {}
 }
 
@@ -836,10 +342,10 @@ static void DYBootAlert(void) {
         UIViewController *vc = DYTopVC();
         if (!vc) return;
         @try {
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v12 注入测试"
-                message:@"v12 止血版：移除 KVC（修崩溃）+ 新增 addCommentParams body 注入 + 日志即时落盘。\ntype=21。发一条普通评论（不必@），去网页端/别人手机看是否红。\n日志以 Documents/dyprobe_dump.txt 为准。"
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v13 只读诊断"
+                message:@"本版只读、不改任何对象，不会再闪退。\n发一条普通评论，然后把 Documents/dyprobe_dump.txt 给我。\n目的：抓清真实 body 结构与 hook 点（这次评论不会变红）。"
                 preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ DYCopyToPasteboard(); }]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ DYCopyLog(); }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleCancel handler:nil]];
             [vc presentViewController:ac animated:YES completion:nil];
         } @catch (...) {}
@@ -853,24 +359,15 @@ __attribute__((constructor)) static void DYInit(void) {
         gOrigBySel = [NSMutableDictionary dictionary];
         gHookedKeys = [NSMutableSet set];
         gSeenHits = [NSMutableSet set];
-        DYAppend(@"DYProbe v12 init (body层注入 type=21; 无KVC止血; addCommentParams专用; 日志即时落盘)");
-        DYFlushLog();
+        DYAppend(@"DYProbe v13 init (纯只读诊断探针 type=21 参考; 零注入/零KVC/零返回值修改)");
     }
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
         object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
             @autoreleasepool {
                 DYBootAlert();
-                for (int r = 0; r < 5; r++) {
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(r * 1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        @autoreleasepool {
-                            DYAppend([NSString stringWithFormat:@"--- hook round %d ---", r]);
-                            DYInstallSetTypeHook();
-                            if (r == 0) DYHookBodyLayer();   /* body 层只挂一次，全类扫描较重 */
-                            DYHookModelFallback();
-                        }
-                    });
-                }
-                DYStartPolling();
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    @autoreleasepool { DYHookAll(); }
+                });
             }
         }];
 }
