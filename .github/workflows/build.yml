@@ -12,6 +12,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Read version from source
+        id: ver
+        run: |
+          set -e
+          # 版本号从源码里的 DY_BEACON 宏读取，源码改了版本号，产物名自动跟着变
+          V="$(grep -oE 'DY_BEACON[[:space:]]+"\[v[0-9]+\]"' DYProbe.m | grep -oE 'v[0-9]+' | head -1)"
+          if [ -z "$V" ]; then echo "找不到版本号"; exit 1; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "读到版本号: $V"
+
       - name: Install ldid
         run: |
           set -e
@@ -26,8 +36,11 @@ jobs:
           clang --version | head -2
 
       - name: Build dylib (plain clang, no Theos/Logos)
+        env:
+          V: ${{ steps.ver.outputs.version }}
         run: |
           set -ex
+          OUT="DYProbe_${V}.dylib"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           clang -dynamiclib \
             -arch arm64 \
@@ -36,15 +49,17 @@ jobs:
             -fobjc-arc \
             -framework Foundation \
             -framework UIKit \
-            -Wl,-install_name,@rpath/DYProbe.dylib \
-            DYProbe.m -o DYProbe.dylib
-          ldid -S DYProbe.dylib
-          ls -lh DYProbe.dylib
-          file DYProbe.dylib
+            -Wl,-install_name,@rpath/"$OUT" \
+            DYProbe.m -o "$OUT"
+          ldid -S "$OUT"
+          ls -lh "$OUT"
+          file "$OUT"
+          echo "SHA256=$(shasum -a 256 "$OUT" | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "产物: $OUT" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DYProbe-dylib
-          path: DYProbe.dylib
+          name: DYProbe-${{ steps.ver.outputs.version }}
+          path: DYProbe_${{ steps.ver.outputs.version }}.dylib
           if-no-files-found: error
