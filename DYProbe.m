@@ -5,47 +5,42 @@
 #import <stdlib.h>
 #import <mach/mach.h>
 #import <mach/vm_map.h>
-#import <mach/vm_prot.h>
-#import <mach/vm_param.h>
 #import <unistd.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 
 /*
- * DYProbe v15 — 在 SSL_write 抄明文（只读，不改一个字节）
+ * DYProbe v16 — 在 SSL_write 抄明文（只读，不改一个字节）
  * ============================================================================
- * 为什么是这里（静态分析已确认）：
- *   - boringssl.framework 只导出 SSL_write / SSL_read，没有 _ex 版本
- *   - AwemeCore 只导入 SSL_write，没有 SSL_write_ex
- *   - 不存在独立 QUIC 库 → 抖音 TLS 流量必经 SSL_write
- *   - Charles 抓不到 amemv.com（TTNet 不走系统代理），Pinning 也挡；
- *     但 SSL_write 是加密前明文，两者都绕过了
+ * v15 实测结论（用户日志，2026-11-20 00:04）：
+ *   启动正常、不闪退；dlsym SSL_write = 0x105e0c244；
+ *   AwemeCore / ByteRtsEngineKit / OmniStream / RTCLive / StreamCore / TTFFmpeg / libvcn
+ *   共 7 个 image、7 处 GOT 改写成功。
+ *   但是一条数据都没抄到。
  *
- * 与 v13/v14 的区别（针对两次启动闪退的教训）：
- *   - v13 崩：全类扫描 hook 几百个方法，ABI 靠猜
- *   - v14 崩：constructor 里立刻动手，且遍历了所有 image（含 dyld 共享缓存里的系统库）。
- *             对缓存镜像，linkedit->vmaddr - linkedit->fileoff + slide 算出的基址不成立，
- *             读到的 symtab/strtab 是垃圾 → indirect 索引越界 → 崩。这是最可能的真实崩因。
- *   - v15：延迟 4 秒（App 启动完成后再动手）；只改 1 个符号；跳过系统库；
- *          只读 buffer，绝不改内容、绝不改返回值、绝不 hook 业务对象
+ * 为什么抄不到（这是本版唯一改动的原因）：
+ *   v15 的触发条件是 buffer 里能搜到 "comment/publish"。而抖音 API 走 HTTP/2，
+ *   请求路径在 HEADERS 帧里被 HPACK 压缩，明文字节流中不存在 "comment/publish"；
+ *   备选条件 "text=" + "aweme_id" 也不成立（body 多为 params=<urlencoded JSON>）。
+ *   → hook 是活的，是筛选条件太窄，把目标全滤掉了。
+ *
+ * v16 的做法：不再猜特征，改成「有界全量记录 + 心跳计数」。
+ *   1) 每次 SSL_write 都计数，第 1/100/200... 次打心跳 → 一眼看出 hook 有没有被调用
+ *   2) 长度 <= 8192 的写入全部抄下来（API 请求都在这个量级；媒体分片通常几十 KB~MB，自然被排除）
+ *   3) 命中 "text"/"aweme_id"/"params" 的，头部打 ★HIT 便于检索
+ *   4) 每次启动清空日志，避免新旧版本混在一个文件里
+ *   5) 抄写有上限（400 段 / 900KB），到顶即停，不会把文件写爆
+ *
+ * 与 v15 相同的安全约束（这部分一行没动，是已经验证不崩的版本）：
+ *   - 延迟 4 秒安装（不在 constructor 里动手）
+ *   - 只改 GOT 指针，只处理 __DATA 段里 S_LAZY/ NON_LAZY_SYMBOL_POINTERS
+ *   - 不 vm_protect、不扫 ObjC 类、不碰业务对象、不改 buffer、不改返回值
  *
  * 实测结构（AwemeCore，Python 直接解析 Mach-O 得到，非推测）：
  *   - 无 LC_DYLD_CHAINED_FIXUPS（走老的 LC_DYLD_INFO_ONLY）
- *   - 无 __DATA_CONST 段；段只有 __TEXT / __DATA / Data / __LYNX__DATA / __LINKEDIT
- *   - 目标符号全在 __DATA,__la_symbol_ptr（lazy，RW 可写段）：
- *       _SSL_write                 0x31e0e610
- *       _SSL_read                  0x31e0e4a0
- *       _X509_verify_cert          0x31e0ea20
- *       _SSL_CTX_set_custom_verify 0x31e0e160
- *   - 因此：写 GOT 不需要 vm_protect 提权，直接改指针即可。本版不再做任何 mprotect。
- *
- * 只做三件事：
- *   1) dlsym 先拿到 boringssl 里 SSL_write 的真实地址（orig）
- *   2) 把各 image 里的 SSL_write GOT 指针指向本文件的 dy_SSL_write
- *   3) dy_SSL_write 里检查 buffer，命中评论关键词就抄到 dyprobe_dump.txt，然后原样调用 orig
- *
- * 失败模式：hook 不上 = 什么都不发生，App 照常跑。日志里会有明确状态行。
+ *   - 无 __DATA_CONST 段；目标符号全在 __DATA,__la_symbol_ptr（RW，可直接写）
+ *       _SSL_write 0x31e0e610 / _SSL_read 0x31e0e4a0 / _X509_verify_cert 0x31e0ea20
  */
 
 /* ============================ 类型别名 ============================ */
@@ -55,29 +50,61 @@ typedef struct segment_command_64 dy_segment_command_t;
 typedef struct section_64         dy_section_t;
 typedef struct nlist_64           dy_nlist_t;
 
-/* ============================ 日志 ============================ */
+/* ============================ 日志（单句柄 + 加锁 + 落盘） ============================ */
+static NSLock       *g_lock = nil;
+static NSFileHandle *g_fh   = nil;
+
 static NSString *DYLogPath(void) {
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     if (!doc) return nil;
     return [doc stringByAppendingPathComponent:@"dyprobe_dump.txt"];
 }
 
-static void DYWrite(NSString *s) {
-    if (!s) return;
-    NSLog(@"[DYSW15] %@", s);
+static void DYLockInit(void) {
+    if (!g_lock) g_lock = [[NSLock alloc] init];
+}
+
+/* 每次启动清空日志：旧版本（v12/v13/v14/v15）的内容混在一起没法看 */
+static void DYLogReset(void) {
+    DYLockInit();
+    [g_lock lock];
     @try {
+        @try { if (g_fh) { [g_fh closeFile]; g_fh = nil; } } @catch (...) {}
         NSString *p = DYLogPath();
         if (!p) return;
-        NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-        if (!d) return;
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-        if (!fh) {
-            [d writeToFile:p atomically:YES];
-        } else {
-            @try { [fh seekToEndOfFile]; [fh writeData:d]; }
-            @finally { [fh closeFile]; }
+        [[NSData data] writeToFile:p atomically:YES];   /* 截断成空文件 */
+        g_fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        @try { [g_fh seekToEndOfFile]; } @catch (...) {}
+    } @catch (...) {
+    } @finally {
+        [g_lock unlock];
+    }
+}
+
+static void DYWrite(NSString *s) {
+    if (!s) return;
+    NSLog(@"[DYSW16] %@", s);
+    DYLockInit();
+    [g_lock lock];
+    @try {
+        if (!g_fh) {   /* 还没 reset 过（例如极早调用），退化成追加 */
+            NSString *p = DYLogPath();
+            if (!p) return;
+            if (![[NSFileManager defaultManager] fileExistsAtPath:p]) {
+                [[NSData data] writeToFile:p atomically:YES];
+            }
+            g_fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            @try { [g_fh seekToEndOfFile]; } @catch (...) {}
         }
-    } @catch (...) {}
+        NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+        if (g_fh && d) {
+            [g_fh writeData:d];
+            @try { [g_fh synchronizeFile]; } @catch (...) {}   /* 立即落盘，防崩溃丢数据 */
+        }
+    } @catch (...) {
+    } @finally {
+        [g_lock unlock];
+    }
 }
 
 /* ============================ 小工具 ============================ */
@@ -93,13 +120,9 @@ static const void *dy_memmem(const void *h, size_t hl, const void *n, size_t nl)
     return NULL;
 }
 
-/* 把 buffer 转成可读文本：可打印字符保留，换行保留，其余转 '.'
- * 参数全用 C 类型，tag 在函数内部生成 NSString —— 避免 Objective-C 与 C 类型混用。 */
-static void DYDumpBuf(const char *kind, int index, const void *buf, int len) {
-    if (!kind || !buf || len <= 0) return;
-    int n = len > 4096 ? 4096 : len;   /* 单次最多抄 4KB，防止文件爆掉 */
-    const unsigned char *p = (const unsigned char *)buf;
-    NSMutableString *ms = [NSMutableString stringWithCapacity:(NSUInteger)n + 128];
+/* 把字节转成可读文本：可打印字符保留，换行保留，其余转 '.' */
+static NSString *DYSanitize(const unsigned char *p, int n) {
+    NSMutableString *ms = [NSMutableString stringWithCapacity:(NSUInteger)n + 32];
     for (int i = 0; i < n; i++) {
         unsigned char c = p[i];
         if (c == '\n')      [ms appendString:@"\n"];
@@ -108,47 +131,81 @@ static void DYDumpBuf(const char *kind, int index, const void *buf, int len) {
         else if (c >= 32 && c < 127) [ms appendFormat:@"%c", c];
         else                [ms appendString:@"."];
     }
-    NSString *tag    = [NSString stringWithFormat:@"%s#%d", kind, index];
-    NSString *suffix = (len > n) ? @" (截断到4096)" : @"";
-    NSString *head   = [NSString stringWithFormat:@"\n===== %@ len=%d%@ =====\n", tag, len, suffix];
-    NSString *body   = [NSString stringWithFormat:@"%@\n===== END %@ =====", ms, tag];
-    DYWrite([head stringByAppendingString:body]);
+    return ms;
+}
+
+/* 是否像我们要找的东西（只用于打标记，不再作为过滤条件） */
+static BOOL dy_looksInteresting(const unsigned char *p, int n) {
+    if (!p || n <= 0) return NO;
+    size_t len = (size_t)n;
+    if (dy_memmem(p, len, "aweme_id", 8)) return YES;
+    if (dy_memmem(p, len, "text", 4)) return YES;
+    if (dy_memmem(p, len, "params", 6)) return YES;
+    if (dy_memmem(p, len, "comment", 7)) return YES;
+    if (dy_memmem(p, len, "reply", 5)) return YES;
+    return NO;
 }
 
 /* ============================ 核心：SSL_write ============================ */
 typedef int (*dy_ssl_write_t)(void *ssl, const void *buf, int num);
 static dy_ssl_write_t orig_SSL_write = NULL;
 
-static int g_dumpCount = 0;
-static const int kDumpLimit = 40;      /* 总共最多抄 40 段，够定位了 */
+static volatile int       g_calls       = 0;
+static volatile long long g_bytes       = 0;
+static int                g_dumpCount   = 0;
+static long long          g_dumpedBytes = 0;
 
-/* 命中判定：评论发布请求的特征 */
-static BOOL dy_isCommentPublish(const void *buf, int len) {
-    if (!buf || len <= 0) return NO;
-    size_t n = (size_t)len;
-    if (dy_memmem(buf, n, "comment/publish", 15)) return YES;   /* HTTP/1.1 请求行 */
-    if (dy_memmem(buf, n, "/aweme/v1/comment", 17)) return YES; /* 路径片段 */
-    /* HTTP/2 下请求行被 HPACK 压缩搜不到，但 body 里 text= 是明文 */
-    if (dy_memmem(buf, n, "text=", 5) && dy_memmem(buf, n, "aweme_id", 8)) return YES;
-    return NO;
+static const int       kSmallLimit   = 8192;          /* 只抄 <=8KB 的写入（API 请求量级） */
+static const int       kDumpMaxCount = 400;           /* 最多 400 段 */
+static const long long kDumpMaxBytes = 900 * 1024;    /* 或者 900KB，先到为准 */
+static const int       kHeadBytes    = 3072;
+static const int       kTailBytes    = 512;
+
+static void DYDumpWrite(int idx, const void *buf, int len) {
+    const unsigned char *p = (const unsigned char *)buf;
+    int head = (len > kHeadBytes) ? kHeadBytes : len;
+    BOOL hit = dy_looksInteresting(p, len);
+
+    NSMutableString *s = [NSMutableString stringWithCapacity:(NSUInteger)head + 256];
+    [s appendFormat:@"\n===== SSL_write#%d len=%d %@=====\n", idx, len, hit ? @"★HIT " : @""];
+    [s appendString:DYSanitize(p, head)];
+    if (len > head) {
+        int tail = (len < kTailBytes) ? len : kTailBytes;
+        [s appendString:@"\n...[TAIL]...\n"];
+        [s appendString:DYSanitize(p + (len - tail), tail)];
+    }
+    [s appendString:@"\n===== END ====="];
+    DYWrite(s);
 }
 
 static int dy_SSL_write(void *ssl, const void *buf, int num) {
-    @autoreleasepool {
-        if (buf && num > 0 && g_dumpCount < kDumpLimit) {
-            @try {
-                if (dy_isCommentPublish(buf, num)) {
-                    g_dumpCount++;
-                    DYDumpBuf("SSL_write", g_dumpCount, buf, num);
-                }
-            } @catch (...) {}
+    int c = __sync_add_and_fetch(&g_calls, 1);
+
+    if (c == 1 || (c % 100) == 0) {
+        DYWrite([NSString stringWithFormat:@"[v16] 心跳：SSL_write 已调用 %d 次，累计 %lld 字节",
+                 c, (long long)g_bytes]);
+    }
+
+    if (buf && num > 0) {
+        g_bytes += num;
+        /* 只抄小包：媒体分片通常几十 KB~MB，自然排除；API 请求都在 8KB 以内 */
+        if (num <= kSmallLimit && g_dumpCount < kDumpMaxCount && g_dumpedBytes < kDumpMaxBytes) {
+            g_dumpCount++;
+            g_dumpedBytes += (num > kHeadBytes ? kHeadBytes : num);
+            @try { DYDumpWrite(g_dumpCount, buf, num); } @catch (...) {}
+            if (g_dumpCount == kDumpMaxCount || g_dumpedBytes >= kDumpMaxBytes) {
+                DYWrite([NSString stringWithFormat:
+                         @"[v16] 已达记录上限（%d 段 / %lld 字节），后续只计数不再抄写",
+                         g_dumpCount, (long long)g_dumpedBytes]);
+            }
         }
     }
+
     if (orig_SSL_write) return orig_SSL_write(ssl, buf, num);
     return -1;
 }
 
-/* ============================ fishhook（精简：只改指定符号的 GOT） ============================ */
+/* ============================ fishhook（与 v15 完全一致，已验证不崩） ============================ */
 struct dy_rebinding { const char *name; void *replacement; };
 
 static struct dy_rebinding g_rb[] = {
@@ -176,7 +233,7 @@ static void dy_rebind_section(dy_section_t *sect, intptr_t slide,
     void **bindings = (void **)((uintptr_t)slide + sect->addr);
     uint32_t *indices = indirect + sect->reserved1;
 
-    /* 先探一遍：这段里到底有没有我们的目标符号。没有就不碰权限，尽量少动内存 */
+    /* 先探一遍：这段里有没有目标符号。没有就完全不动内存 */
     BOOL hit = NO;
     for (size_t k = 0; k < cnt; k++) {
         uint32_t si = indices[k];
@@ -186,9 +243,7 @@ static void dy_rebind_section(dy_section_t *sect, intptr_t slide,
     }
     if (!hit) return;
 
-    /* 实测：目标符号位于 __DATA,__la_symbol_ptr，该段本身可写，
-     * 直接改指针即可。v14 里那套 vm_protect 提权是多余的，本版全部去掉。 */
-
+    /* 目标符号位于 __DATA,__la_symbol_ptr，该段本身可写，直接改指针即可 */
     for (size_t k = 0; k < cnt; k++) {
         uint32_t si = indices[k];
         if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL ||
@@ -235,8 +290,7 @@ static void dy_rebind_image(const struct mach_header *header, intptr_t slide) {
         if (seg->cmdsize == 0) break;
         cur += seg->cmdsize;
         if (seg->cmd != LC_SEGMENT_64) continue;
-        /* 只处理 __DATA（RW 可写段）。实测 AwemeCore 无 __DATA_CONST；
-         * 限定 __DATA 也顺带避免误碰其他 image 的只读段。 */
+        /* 只处理 __DATA（RW 可写段）。实测 AwemeCore 无 __DATA_CONST */
         if (strcmp(seg->segname, SEG_DATA) != 0) continue;
         dy_section_t *sect = (dy_section_t *)((uintptr_t)seg + sizeof(dy_segment_command_t));
         for (uint32_t j = 0; j < seg->nsects; j++, sect++) {
@@ -247,13 +301,16 @@ static void dy_rebind_image(const struct mach_header *header, intptr_t slide) {
 
 /* ============================ 安装（延迟执行） ============================ */
 static void dy_install(void) {
+    DYLogReset();
+    DYWrite(@"[v16] ===== 本次启动开始（本文件已清空，只含本次记录）=====");
+
     void *p = dlsym(RTLD_DEFAULT, "SSL_write");
     if (!p) {
-        DYWrite(@"[v15] dlsym SSL_write = NULL（boringssl 未加载），放弃安装");
+        DYWrite(@"[v16] dlsym SSL_write = NULL（boringssl 未加载），放弃安装");
         return;
     }
     orig_SSL_write = (dy_ssl_write_t)p;
-    DYWrite([NSString stringWithFormat:@"[v15] dlsym SSL_write = %p", p]);
+    DYWrite([NSString stringWithFormat:@"[v16] dlsym SSL_write = %p", p]);
 
     uint32_t total = _dyld_image_count();
     uint32_t scanned = 0;
@@ -267,26 +324,27 @@ static void dy_install(void) {
         int before = g_replaced;
         dy_rebind_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
         if (g_replaced != before) {
-            DYWrite([NSString stringWithFormat:@"[v15] 命中 image: %s（改写 %d 处）", nm, g_replaced - before]);
+            DYWrite([NSString stringWithFormat:@"[v16] 命中 image: %s（改写 %d 处）", nm, g_replaced - before]);
         }
         scanned++;
     }
-    DYWrite([NSString stringWithFormat:@"[v15] 安装完成：扫描 %u/%u 个非系统 image，改写 GOT %d 处",
+    DYWrite([NSString stringWithFormat:@"[v16] 安装完成：扫描 %u/%u 个非系统 image，改写 GOT %d 处",
              scanned, total, g_replaced]);
     if (g_replaced == 0) {
-        DYWrite(@"[v15] 注意：改写 0 处 → hook 未生效（SSL_write 可能不在 LDYNSYM 指针段），抓不到数据但不影响 App");
+        DYWrite(@"[v16] 注意：改写 0 处 → hook 未生效（SSL_write 可能不在指针段），抓不到数据但不影响 App");
+    } else {
+        DYWrite(@"[v16] 请发一条评论（内容随意，例如 tt21），然后退出抖音导出本文件");
     }
 }
 
 __attribute__((constructor)) static void DYInit(void) {
-    /* 不在 constructor 里立刻动手：那一刻所有 image 仍在加载与初始化，
+    /* 不在 constructor 里立刻动手：那一刻各 image 仍在加载，
      * 遍历它们做符号解析容易读到未就绪的数据（v14 崩在这个阶段）。
-     * 延后 4 秒，等 App 启动稳定、各 image 的 `__DATA` 已就绪后再改。 */
+     * 延后 4 秒，等 App 启动稳定、各 image 的 __DATA 已就绪后再改。 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            DYWrite(@"[v15] 启动完成，开始安装 SSL_write 探针");
-            @try { dy_install(); } @catch (...) { DYWrite(@"[v15] 安装异常，已忽略"); }
+            @try { dy_install(); } @catch (...) { DYWrite(@"[v16] 安装异常，已忽略"); }
         }
     });
 }
