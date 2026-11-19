@@ -1,57 +1,73 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <stdarg.h>
+#include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 /*
- * DYProbe v19 —— 参数层探针（不 hook 任何网络函数）
+ * DYProbe v20 —— 加载信标 + 参数层探针
  *
- * 为什么换路：
- *   v15~v18 一直在 hook SSL_write 抄明文。已证：这条路能抄到字节，但
- *     (1) HTTP/2 的 :path 被 HPACK 压掉，comment/publish 明文字节流里根本不出现；
- *     (2) 请求体可能被 zstd 压缩（v17 #52 实测 body 头 = 28 b5 2f fd），抄下来是密文；
- *     (3) 最要命：我们要改的是「参数对象」，不是网络字节。
+ * v19 的致命设计缺陷（本轮教训）：
+ *   唯一的"我加载了"证据，写在 constructor 里 dispatch_after(+3s) 的块中。
+ *   块没跑到（App 在 3 秒内崩、或 dylib 根本没进包）→ 一个字节都不留，
+ *   于是无法区分「没加载」和「加载了但没干活」。这不是探针，是盲猜。
  *
- * 二进制里挖到的事实（抖音 41.0.0 AwemeCore）：
- *   aweme/v1/comment/publish/?need_shark_async=1
- *   AWECommentSwiftImpl.CommentPublishRequestProvider
- *   AWEKMPBaseCommentPublishParameters (+Builder / +Companion)
- *   独立字符串 "text_extra" 全二进制只有 1 处，且属于「评论列表响应模型」，
- *   发布侧没有这个字面量 —— 它由 KMP 序列化层生成（属性 textExtra -> key text_extra），
- *   与 translate 接口参数 comment_text_extra 同一命名规则。
+ * v20 的硬要求：**constructor 第一行就必须落盘**，且满足：
+ *   1) 纯 C（getenv + fopen + fprintf），不碰 Foundation —— 不依赖任何初始化顺序
+ *   2) 不依赖 dispatch —— dispatch_after 万一不触发也有证据
+ *   3) 一次写 3 个路径（Documents ×2 + TMPDIR），任一存在即可读到
+ *   4) 写失败不 return，继续走后面的流程
  *
- * 而 v7 早就实测到：真正要发出去的发布参数字典是
- *   AWECommentPublishParameterModel.extraParams
- * （当时看到 author_secuid / common_flags / hashtag ...，但被 600 字符截断）
- *
- * 所以 v19 只做三件事，全部不碰网络：
- *   1) 把 AWECommentPublishParameterModel 的属性表/方法表写进文件 —— 不发评论也有情报
- *   2) 挂 extraParams 的 getter / setter，完整 dump 字典（不再截断到 600）
- *   3) 影子注入：算出「如果把 type 改成 21 会长什么样」并写进日志，但**不改原对象**
- *
- * 日志：Documents/dyprobe_params.txt（每次写都 fflush，进程被杀也不丢）
+ * 之后的逻辑与 v19 一致：不 hook 任何网络函数（HTTP/3 QUIC，hook SSL_write 无效已证），
+ * 只抄 AWEKMPBaseCommentPublishParameters 的结构 + 挂 extraParams 全量 dump。
  */
 
 #define DY_MAXLEN  16000
-#define DY_LOGN    30          /* getter/setter 各最多详细记 30 次 */
+#define DY_LOGN    30
+#define DY_BEACON  "[v20]"
 
-static FILE  *g_fp     = NULL;
-static int    g_getN   = 0;
-static int    g_setN   = 0;
-static int    g_getLog = 0;
-static int    g_setLog = 0;
-static IMP    g_origGet = NULL;
-static IMP    g_origSet = NULL;
+static int g_getN = 0, g_setN = 0, g_getLog = 0, g_setLog = 0;
+static IMP g_origGet = NULL, g_origSet = NULL;
 
-/* ------------------------------ 日志 ------------------------------ */
-static NSString *DYPath(void) {
-    NSString *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    if (!d) return nil;
-    return [d stringByAppendingPathComponent:@"dyprobe_params.txt"];
+/* ===================== 信标：纯 C，constructor 可用 ===================== */
+static void DYBeacon(const char *msg) {
+    time_t t = time(NULL);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char stamp[64];
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tmv);
+
+    const char *home = getenv("HOME");
+    const char *tmpd = getenv("TMPDIR");
+
+    char p1[512] = {0}, p2[512] = {0}, p3[512] = {0};
+    const char *paths[3];
+    int n = 0;
+    if (home) {
+        snprintf(p1, sizeof(p1), "%s/Documents/dyprobe_params.txt", home);
+        snprintf(p2, sizeof(p2), "%s/Documents/dyprobe_v20.txt", home);
+        paths[n++] = p1;
+        paths[n++] = p2;
+    }
+    if (tmpd) {
+        snprintf(p3, sizeof(p3), "%s/dyprobe_v20.txt", tmpd);
+        paths[n++] = p3;
+    }
+
+    for (int i = 0; i < n; i++) {
+        FILE *f = fopen(paths[i], "a");
+        if (!f) continue;
+        fprintf(f, "%s %s | %s\n", DY_BEACON, msg, stamp);
+        fflush(f);
+        fclose(f);          /* 立刻关，进程被杀也不丢 */
+    }
 }
 
+/* ===================== 带格式的日志（追加到同一批文件） ===================== */
 static void L(NSString *fmt, ...) {
     if (!fmt) return;
     va_list ap;
@@ -60,19 +76,25 @@ static void L(NSString *fmt, ...) {
     va_end(ap);
     if (!s) return;
 
-    if (!g_fp) {
-        NSString *p = DYPath();
-        if (!p) return;
-        g_fp = fopen(p.fileSystemRepresentation, "a");
-        if (!g_fp) return;
+    NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d || !d.length) return;
+
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSMutableArray<NSString *> *targets = [NSMutableArray array];
+    if (docs) {
+        [targets addObject:[docs stringByAppendingPathComponent:@"dyprobe_params.txt"]];
+        [targets addObject:[docs stringByAppendingPathComponent:@"dyprobe_v20.txt"]];
     }
-    @try {
-        NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-        if (d && d.length) {
-            fwrite(d.bytes, 1, d.length, g_fp);
-            fflush(g_fp);          /* 关键：不用等 fsync，内核已可见 */
-        }
-    } @catch (...) {}
+    NSString *td = NSTemporaryDirectory();
+    if (td) [targets addObject:[td stringByAppendingPathComponent:@"dyprobe_v20.txt"]];
+
+    for (NSString *p in targets) {
+        FILE *f = fopen(p.fileSystemRepresentation, "a");
+        if (!f) continue;
+        fwrite(d.bytes, 1, d.length, f);
+        fflush(f);
+        fclose(f);
+    }
 }
 
 static NSString *DYStr(id o) {
@@ -96,7 +118,7 @@ static NSString *DYStr(id o) {
     return s;
 }
 
-/* --------------------------- 类结构导出 --------------------------- */
+/* ===================== 类结构导出 ===================== */
 static void DYDumpClass(Class c, const char *tag) {
     if (!c) { L(@"[%s] 类不存在", tag); return; }
     L(@"\n---- 类 %s ----", class_getName(c));
@@ -115,7 +137,7 @@ static void DYDumpClass(Class c, const char *tag) {
     unsigned int mn = 0;
     Method *ms = class_copyMethodList(c, &mn);
     NSMutableArray *ma = [NSMutableArray array];
-    for (unsigned int i = 0; i < mn && i < 150; i++) {
+    for (unsigned int i = 0; i < mn && i < 200; i++) {
         const char *sn = sel_getName(method_getName(ms[i]));
         const char *te = method_getTypeEncoding(ms[i]);
         if (sn) [ma addObject:[NSString stringWithFormat:@"%s [%s]", sn, te ? te : "?"]];
@@ -125,7 +147,7 @@ static void DYDumpClass(Class c, const char *tag) {
     L(@"----------------");
 }
 
-/* --------------------------- 影子注入 --------------------------- */
+/* ===================== 影子注入（只算不改） ===================== */
 static void DYShadow(id dict, NSString *tag) {
     if (![dict isKindOfClass:[NSDictionary class]]) {
         L(@"[SHADOW %@] 不是字典，实际类型 %@", tag, NSStringFromClass([dict class]));
@@ -145,7 +167,6 @@ static void DYShadow(id dict, NSString *tag) {
     if (!txt) txt = [d objectForKey:@"content"];
     L(@"[TEXT %@] %@", tag, DYStr(txt));
 
-    /* 算出「注入 type=21 之后」的样子，只打印，不改真对象 */
     NSMutableArray *out = [NSMutableArray array];
     if ([te isKindOfClass:[NSArray class]]) {
         for (id e in (NSArray *)te) {
@@ -165,12 +186,10 @@ static void DYShadow(id dict, NSString *tag) {
     L(@"[SHADOW %@] 若注入 type=21 -> %@", tag, DYStr(out));
 }
 
-/* ----------------------------- hook ----------------------------- */
+/* ===================== hook ===================== */
 static id dy_get(id self, SEL _cmd) {
     id r = nil;
-    if (g_origGet) {
-        @try { r = ((id (*)(id, SEL))g_origGet)(self, _cmd); } @catch (...) {}
-    }
+    if (g_origGet) { @try { r = ((id (*)(id, SEL))g_origGet)(self, _cmd); } @catch (...) {} }
     g_getN++;
     if (g_getLog < DY_LOGN) {
         g_getLog++;
@@ -193,9 +212,7 @@ static void dy_set(id self, SEL _cmd, id v) {
             DYShadow(v, [NSString stringWithFormat:@"set#%d", g_setN]);
         } @catch (...) {}
     }
-    if (g_origSet) {
-        @try { ((void (*)(id, SEL, id))g_origSet)(self, _cmd, v); } @catch (...) {}
-    }
+    if (g_origSet) { @try { ((void (*)(id, SEL, id))g_origSet)(self, _cmd, v); } @catch (...) {} }
 }
 
 static BOOL DYHookSel(Class c, const char *selName, BOOL isSetter) {
@@ -206,13 +223,12 @@ static BOOL DYHookSel(Class c, const char *selName, BOOL isSetter) {
     const char *enc = method_getTypeEncoding(m);
     if (!enc) return NO;
 
-    /* 统计 '@' 个数：setter 形如 v24@0:8@16 / v@:@，必然有两个 '@'（self + 参数） */
     int at = 0;
     for (const char *q = enc; *q; q++) if (*q == '@') at++;
 
     if (isSetter) {
         if (enc[0] != 'v' || at < 2) {
-            L(@"[SKIP] setter %s 签名 %s 不是对象入参，跳过（不乱挂）", selName, enc);
+            L(@"[SKIP] setter %s 签名 %s 不是对象入参，跳过", selName, enc);
             return NO;
         }
         g_origSet = method_setImplementation(m, (IMP)dy_set);
@@ -229,7 +245,7 @@ static BOOL DYHookSel(Class c, const char *selName, BOOL isSetter) {
     return g_origGet != NULL;
 }
 
-/* ---- 兜底：按选择器在运行时里找「谁定义了 extraParams」，不靠类名猜 ---- */
+/* 按选择器反查，不靠类名猜 */
 static Class DYFindBySelector(const char *selName) {
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return Nil;
@@ -245,7 +261,6 @@ static Class DYFindBySelector(const char *selName) {
         Class c = all[i];
         const char *cn = class_getName(c);
         if (!cn) continue;
-        /* 只扫名字沾边的，避免遍历几万个类把启动拖慢 */
         if (!(strstr(cn, "Comment") || strstr(cn, "Publish") || strstr(cn, "Param"))) continue;
 
         unsigned int mn = 0;
@@ -266,15 +281,37 @@ static Class DYFindBySelector(const char *selName) {
     return best;
 }
 
+/* 列出运行时所有含 Comment/Publish 的类名，作为情报兜底 */
+static void DYListCandidates(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *all = (Class *)calloc((size_t)n, sizeof(Class));
+    if (!all) return;
+    n = objc_getClassList(all, n);
+    NSMutableArray *hit = [NSMutableArray array];
+    for (int i = 0; i < n; i++) {
+        const char *nm = class_getName(all[i]);
+        if (!nm) continue;
+        if (strstr(nm, "CommentPublish") || strstr(nm, "PublishParameter") ||
+            strstr(nm, "PublishParams") || strstr(nm, "TextExtra")) {
+            [hit addObject:[NSString stringWithUTF8String:nm]];
+        }
+    }
+    free(all);
+    L(@"[类总数 %d] [CANDIDATES] %@", n, [hit componentsJoinedByString:@", "]);
+}
+
 static void DYInstall(void) {
-    /* 先无条件把 KMP 那层的参数类结构抄下来：不发评论也能拿到字段名 */
     @try {
         Class k = objc_getClass("AWEKMPBaseCommentPublishParameters");
         if (k) DYDumpClass(k, "KMPBaseCommentPublishParameters");
         else L(@"[MISS] AWEKMPBaseCommentPublishParameters 不存在");
         Class kb = objc_getClass("AWEKMPBaseCommentPublishParametersBuilder");
         if (kb) DYDumpClass(kb, "KMPBaseCommentPublishParametersBuilder");
-    } @catch (...) {}
+        else L(@"[MISS] ...Builder 不存在");
+    } @catch (...) { L(@"[ERR] KMP 类 dump 异常"); }
+
+    DYListCandidates();
 
     static const char *cands[] = {
         "AWECommentPublishParameterModel",
@@ -288,27 +325,9 @@ static void DYInstall(void) {
         if (c) { L(@"[FOUND] 命中类名 %s", cands[i]); break; }
     }
     if (!c) {
-        L(@"[MISS] 上面几个类名都不存在。先列出运行时所有含 CommentPublish 的类：");
-        int n = objc_getClassList(NULL, 0);
-        if (n > 0) {
-            Class *all = (Class *)calloc((size_t)n, sizeof(Class));
-            if (all) {
-                n = objc_getClassList(all, n);
-                NSMutableArray *hit = [NSMutableArray array];
-                for (int i = 0; i < n; i++) {
-                    const char *nm = class_getName(all[i]);
-                    if (nm && (strstr(nm, "CommentPublish") || strstr(nm, "PublishParameter"))) {
-                        [hit addObject:[NSString stringWithUTF8String:nm]];
-                    }
-                }
-                free(all);
-                L(@"[CANDIDATES] %@", [hit componentsJoinedByString:@", "]);
-            }
-        }
-        /* 不靠类名猜了，直接按选择器反查 */
         c = DYFindBySelector("extraParams");
         if (!c) {
-            L(@"[MISS] 运行时没有任何类定义 -extraParams，本版拿不到参数字典");
+            L(@"[MISS] 运行时没有任何类定义 -extraParams");
             return;
         }
         L(@"[FOUND] 按选择器扫描命中 %s", class_getName(c));
@@ -320,7 +339,6 @@ static void DYInstall(void) {
     if (DYHookSel(c, "extraParams", NO)) ok = YES;
     if (DYHookSel(c, "setExtraParams:", YES)) ok = YES;
 
-    /* 兜底：按属性名找其它含 extra 的 getter */
     if (!ok) {
         unsigned int pn = 0;
         objc_property_t *ps = class_copyPropertyList(c, &pn);
@@ -339,26 +357,26 @@ static void DYInstall(void) {
     L(@"[%@] 结果：%@", ok ? @"OK" : @"FAIL", ok ? @"已挂上发布参数钩子" : @"没找到可挂的方法");
 }
 
-/* ----------------------------- 入口 ----------------------------- */
+/* ===================== 入口 ===================== */
 __attribute__((constructor)) static void DYInit(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    /* 第一行，纯 C，任何时候都留痕 */
+    DYBeacon("dylib 已加载 · constructor 立即写入");
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            L(@"\n\n========== [v19] 会话开始 %@ ==========", [NSDate date]);
-            L(@"[v19] 本版不 hook 任何网络函数，评论该发得出去");
-            @try { DYInstall(); } @catch (...) { L(@"[v19] 安装异常，已忽略"); }
-            L(@"[v19] 就绪：进视频评论区发一条 tt21。发完看到评论出现在列表里就行（有没有 toast 不影响）");
-            L(@"[v19] 然后杀进程，导出 Documents/dyprobe_params.txt");
-            L(@"[v19] 文件：Documents/dyprobe_params.txt");
+            L(@"\n========== [v20] 安装开始 %@ ==========", [NSDate date]);
+            @try { DYInstall(); } @catch (...) { L(@"[v20] 安装异常，已忽略"); }
+            L(@"[v20] 就绪：进视频评论区发一条 tt21");
+            L(@"[v20] 文件：Documents/dyprobe_params.txt 或 dyprobe_v20.txt（内容相同）");
         }
     });
 
-    for (int i = 1; i <= 5; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 15.0 * NSEC_PER_SEC)),
+    for (int i = 1; i <= 4; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 10.0 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             @autoreleasepool {
-                L(@"[心跳 %ds] 活着 / getter %d 次 / setter %d 次 / 时间 %@",
-                  i * 15, g_getN, g_setN, [NSDate date]);
+                L(@"[心跳 %ds] getter %d / setter %d", i * 10, g_getN, g_setN);
             }
         });
     }
