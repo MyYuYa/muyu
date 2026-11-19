@@ -220,13 +220,50 @@ static BOOL DYHookSel(Class c, const char *selName, BOOL isSetter) {
         return g_origSet != NULL;
     }
 
-    if (!(enc[0] == '@' && enc[1] == '@' && enc[2] == ':')) {
+    if (!(strlen(enc) >= 3 && enc[0] == '@' && enc[1] == '@' && enc[2] == ':')) {
         L(@"[SKIP] getter %s 签名 %s 不是 @@:，跳过", selName, enc);
         return NO;
     }
     g_origGet = method_setImplementation(m, (IMP)dy_get);
     L(@"[HOOK] getter %s 已挂 (enc=%s)", selName, enc);
     return g_origGet != NULL;
+}
+
+/* ---- 兜底：按选择器在运行时里找「谁定义了 extraParams」，不靠类名猜 ---- */
+static Class DYFindBySelector(const char *selName) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return Nil;
+    Class *all = (Class *)calloc((size_t)n, sizeof(Class));
+    if (!all) return Nil;
+    n = objc_getClassList(all, n);
+
+    SEL want = sel_registerName(selName);
+    NSMutableArray *hits = [NSMutableArray array];
+    Class best = Nil;
+
+    for (int i = 0; i < n; i++) {
+        Class c = all[i];
+        const char *cn = class_getName(c);
+        if (!cn) continue;
+        /* 只扫名字沾边的，避免遍历几万个类把启动拖慢 */
+        if (!(strstr(cn, "Comment") || strstr(cn, "Publish") || strstr(cn, "Param"))) continue;
+
+        unsigned int mn = 0;
+        Method *ms = class_copyMethodList(c, &mn);
+        BOOL has = NO;
+        for (unsigned int j = 0; j < mn; j++) {
+            if (sel_isEqual(method_getName(ms[j]), want)) { has = YES; break; }
+        }
+        if (ms) free(ms);
+        if (has) {
+            [hits addObject:[NSString stringWithUTF8String:cn]];
+            if (!best) best = c;
+        }
+    }
+    free(all);
+    L(@"[SWEEP] 定义了 -%s 的类共 %lu 个：%@", selName,
+      (unsigned long)hits.count, [hits componentsJoinedByString:@", "]);
+    return best;
 }
 
 static void DYInstall(void) {
@@ -251,7 +288,7 @@ static void DYInstall(void) {
         if (c) { L(@"[FOUND] 命中类名 %s", cands[i]); break; }
     }
     if (!c) {
-        L(@"[MISS] 上面几个类名都不存在。下面列出运行时所有含 CommentPublish 的类：");
+        L(@"[MISS] 上面几个类名都不存在。先列出运行时所有含 CommentPublish 的类：");
         int n = objc_getClassList(NULL, 0);
         if (n > 0) {
             Class *all = (Class *)calloc((size_t)n, sizeof(Class));
@@ -268,7 +305,13 @@ static void DYInstall(void) {
                 L(@"[CANDIDATES] %@", [hit componentsJoinedByString:@", "]);
             }
         }
-        return;
+        /* 不靠类名猜了，直接按选择器反查 */
+        c = DYFindBySelector("extraParams");
+        if (!c) {
+            L(@"[MISS] 运行时没有任何类定义 -extraParams，本版拿不到参数字典");
+            return;
+        }
+        L(@"[FOUND] 按选择器扫描命中 %s", class_getName(c));
     }
 
     DYDumpClass(c, "PublishParameterModel");
@@ -304,16 +347,18 @@ __attribute__((constructor)) static void DYInit(void) {
             L(@"\n\n========== [v19] 会话开始 %@ ==========", [NSDate date]);
             L(@"[v19] 本版不 hook 任何网络函数，评论该发得出去");
             @try { DYInstall(); } @catch (...) { L(@"[v19] 安装异常，已忽略"); }
-            L(@"[v19] 就绪：进视频评论区发一条 tt21，看到“评论成功”后杀进程导出本文件");
+            L(@"[v19] 就绪：进视频评论区发一条 tt21。发完看到评论出现在列表里就行（有没有 toast 不影响）");
+            L(@"[v19] 然后杀进程，导出 Documents/dyprobe_params.txt");
             L(@"[v19] 文件：Documents/dyprobe_params.txt");
         }
     });
 
-    for (int i = 1; i <= 3; i++) {
+    for (int i = 1; i <= 5; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 15.0 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             @autoreleasepool {
-                L(@"[心跳 %ds] 活着 / getter %d 次 / setter %d 次", i * 15, g_getN, g_setN);
+                L(@"[心跳 %ds] 活着 / getter %d 次 / setter %d 次 / 时间 %@",
+                  i * 15, g_getN, g_setN, [NSDate date]);
             }
         });
     }
