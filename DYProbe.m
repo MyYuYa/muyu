@@ -4,16 +4,21 @@
 #import <string.h>
 
 /*
- * DYProbe v9 - v8 基础上新增「extraInfo 里 AWETextExtra.type 0->21」写入
+ * DYProbe v10 - 【关键修正】彩色字 type 用 65282，不是 21
  *
- * v8 实测定性（21:12）：extraParams 字典注入了 type=21、回读也带上了，但网页端不红。
- *   根因判定：extraParams 是统计/上下文参数包(author_secuid/common_flags/unique_key)，
- *   服务端生成请求 text_extra 用的是 contentModel.extraInfo 里的 AWETextExtra 对象。
- *   发布时那个 @ 用户对象 type=0（日志 setExtraInfo: ... type = 0）—— 服务端照它生成普通@。
+ * 网页油猴脚本 Super Douyin(greasyfork 459135)源码铁证：
+ *   @人   -> text_extra = {start, end, sec_uid, user_id, type: 0}
+ *   彩色字 -> text_extra = {start, end, type: 65282}   (65282 = 0xFF02)
+ *   然后 map.text_extra = encodeURIComponent(JSON.stringify(text_extra)) 发到 /aweme/v1/web/comment/publish/
+ * 所以之前 v5~v9 用的 type=21 全是错值。App 把 21 误当彩色 entity 渲染(瞬间红)，
+ * 但服务端只认 65282 -> 发出去变黑。
  *
- * v9 打法：hook setExtraInfo:(v@:@) 与 extraInfo(@@:)，把数组里每个 AWETextExtra 的 type
- *   用「setType: 原始 IMP」写成 21（绕过本插件的只读 setType hook），只作用于这条正在发布的评论。
- *   v8 的 extraParams 注入保留作双保险。列表展示的 type=21 对象不在 extraInfo 链上，不受影响。
+ * v10 打法：把所有注入值 21 -> 65282。
+ *   1) extraInfo 里 AWETextExtra 的 type 用原始 setType: 写成 65282（本地渲染也对）
+ *   2) extraParams 字典的 textExtra/text_extra 元素 type 改成 65282；无键则插入 {start:0,end:len,type:65282}
+ * 双保险：两处都改，只要服务端读其中任一处即可生效。
+ *
+ * v9 实测回顾：改 extraInfo.type=21 后本地瞬间红、发出去黑 -> 证明打点对(渲染链路读它)、值错了。
  *
  * v7 决定性发现：
  *   - [SET-TYPE #2] 原值=0 紧跟 setContent: -> 列表选人@时 App 生成 textExtra type=0（发布链路）
@@ -25,9 +30,9 @@
  *   真正进请求体的是 AWECommentPublishParameterModel 的 extraParams 字典。
  *   hook 它的 getter(extraParams, @@:) 和 setter(setExtraParams:, v@:@)：
  *     1) 完整 dump（上限 6000，不再 600 截断）—— 看清 textExtra / text_extra 到底在哪
- *     2) 定点注入：字典里若有 textExtra/text_extra 数组，把每个元素 type 改成 @21；
- *        若完全没有，按网页端格式插一个 text_extra=[{start:0,end:内容长度,type:21}]
- *   这最接近油猴脚本在网页端 /aweme/v1/web/comment/publish/ 请求体里加 text_extra type=21 的做法。
+ *     2) 定点注入：字典里若有 textExtra/text_extra 数组，把每个元素 type 改成 @65282；
+ *        若完全没有，按网页端格式插一个 text_extra=[{start:0,end:内容长度,type:65282}]
+ *   这最接近油猴脚本在网页端 /aweme/v1/web/comment/publish/ 请求体里加 text_extra type=65282 的做法。
  *
  * 防闪退（继承 v3-v7）：类白名单、零 ivar 遍历、内容去重、日志上限、全程 try/catch、只在确认有字典时才改。
  * 用法：装上->用抖音@功能选一个人发评论->看网页端是否变红->把剪贴板日志发回。
@@ -50,7 +55,7 @@ static NSInteger gStackCount = 0;
 static NSInteger gParamDumpCount = 0;
 static NSInteger gLastContentLen = 0;
 static NSInteger gModelTypeHit = 0;   /* v9: setType 写入 21 的次数 */
-static NSInteger gRedSampleDump = 0;  /* v9.1: 真实红字对象(type=21)完整结构 dump 次数，限 3 */
+static NSInteger gRedSampleDump = 0;  /* 真实彩色字对象(type=65282)完整结构 dump 次数，限 3 */
 static NSInteger gPubObjDump = 0;     /* v9.1: 发布 @ 对象完整结构 dump 次数，限 3 */
 
 static void DYAppend(NSString *line) {
@@ -186,9 +191,9 @@ static void dy_setType_int(id self, SEL _cmd, long long v) {
             DYFlushLog();
         }
         /* v9.1: App 自己传入 21 = 一条真实红字评论的 textExtra 对象，抓全字段当模板 */
-        if (v == 21 && gRedSampleDump < 3) {
+        if (v == 65282 && gRedSampleDump < 3) {
             gRedSampleDump++;
-            DYAppend([NSString stringWithFormat:@"===== [RED-SAMPLE #%ld] iOS 本地真实红字 type=21 对象完整结构 =====", (long)gRedSampleDump]);
+            DYAppend([NSString stringWithFormat:@"===== [RED-SAMPLE #%ld] iOS 本地真实彩色字 type=65282 对象完整结构 =====", (long)gRedSampleDump]);
             DYAppend(DYSafeFull(self));
             DYFlushLog();
         }
@@ -212,7 +217,7 @@ static void dy_setType_obj(id self, SEL _cmd, id v) {
     }
 }
 
-/* ---------- 核心：发布参数字典 抓全 + 定点注入 type=21 ---------- */
+/* ---------- 核心：发布参数字典 抓全 + 定点注入 type=65282 ---------- */
 static id DYMutateExtraParams(id params, NSString *tag) {
     @try {
         if (!params) return params;
@@ -245,7 +250,7 @@ static id DYMutateExtraParams(id params, NSString *tag) {
                     id e = [ma objectAtIndex:i];
                     if ([e isKindOfClass:[NSDictionary class]] || [e isKindOfClass:[NSMutableDictionary class]]) {
                         NSMutableDictionary *me = ([e isKindOfClass:[NSMutableDictionary class]]) ? e : [e mutableCopy];
-                        [me setObject:@21 forKey:@"type"];
+                        [me setObject:@65282 forKey:@"type"];
                         [ma replaceObjectAtIndex:i withObject:me];
                         changed = YES;
                     }
@@ -256,13 +261,13 @@ static id DYMutateExtraParams(id params, NSString *tag) {
         /* 完全没有 textExtra 键：按网页端格式插一个（模仿油猴脚本请求体） */
         if (!changed) {
             NSUInteger endLen = (gLastContentLen > 0) ? (NSUInteger)gLastContentLen : 14;
-            NSArray *one = @[ @{ @"start": @0, @"end": @(endLen), @"type": @21 } ];
+            NSArray *one = @[ @{ @"start": @0, @"end": @(endLen), @"type": @65282 } ];
             [md setObject:one forKey:@"text_extra"];
             [md setObject:one forKey:@"textExtra"];
-            DYAppend([NSString stringWithFormat:@"[INJECT] %@ 无 textExtra 键，已插入 text_extra=[{start:0,end:%lu,type:21}]", tag, (unsigned long)endLen]);
+            DYAppend([NSString stringWithFormat:@"[INJECT] %@ 无 textExtra 键，已插入 text_extra=[{start:0,end:%lu,type:65282}]", tag, (unsigned long)endLen]);
             DYFlushLog();
         } else {
-            DYAppend([NSString stringWithFormat:@"[INJECT] %@ 已把 textExtra 元素 type 改成 21", tag]);
+            DYAppend([NSString stringWithFormat:@"[INJECT] %@ 已把 textExtra 元素 type 改成 65282", tag]);
             DYFlushLog();
         }
         return md;
@@ -288,7 +293,7 @@ static void dy_setExtraParams(id self, SEL _cmd, id arg) {
     if (orig) { @try { ((void(*)(id,SEL,id))orig)(self, _cmd, mutated); } @catch (...) {} }
 }
 
-/* ---------- v9: 把 extraInfo 数组里 AWETextExtra 的 type 0->21（写入，绕过只读 hook） ---------- */
+/* ---------- v10: 把 extraInfo 数组里 AWETextExtra 的 type 0->65282（写入，绕过只读 hook） ---------- */
 static void DYMutateExtraInfo(id arr, NSString *tag) {
     @try {
         if (!arr) return;
@@ -314,9 +319,9 @@ static void DYMutateExtraInfo(id arr, NSString *tag) {
                 IMP realSetType = gOrigSetType;
                 if (realSetType && realSetType != (IMP)dy_setType_int && realSetType != (IMP)dy_setType_obj) {
                     @try {
-                        ((void(*)(id,SEL,long long))realSetType)(e, @selector(setType:), 21LL);
+                        ((void(*)(id,SEL,long long))realSetType)(e, @selector(setType:), 65282LL);
                         gModelTypeHit++;
-                        DYAppend([NSString stringWithFormat:@"[EXTRAINFO-TYPE] %@ [%lu] type 0->21 已写入(第%ld个)", tag, (unsigned long)i, (long)gModelTypeHit]);
+                        DYAppend([NSString stringWithFormat:@"[EXTRAINFO-TYPE] %@ [%lu] type 0->65282 已写入(第%ld个)", tag, (unsigned long)i, (long)gModelTypeHit]);
                         DYFlushLog();
                     } @catch (NSException *ex) {
                         DYAppend([NSString stringWithFormat:@"[EXTRAINFO-TYPE] setType 原始IMP写入异常 %@", ex.name]);
@@ -325,9 +330,9 @@ static void DYMutateExtraInfo(id arr, NSString *tag) {
                 } else {
                     /* 兜底：KVC 写 NSNumber，交给 typeless setter */
                     @try {
-                        [e setValue:@21 forKey:@"type"];
+                        [e setValue:@65282 forKey:@"type"];
                         gModelTypeHit++;
-                        DYAppend([NSString stringWithFormat:@"[EXTRAINFO-TYPE] %@ [%lu] type 0->21 已写入(KVC,第%ld个)", tag, (unsigned long)i, (long)gModelTypeHit]);
+                        DYAppend([NSString stringWithFormat:@"[EXTRAINFO-TYPE] %@ [%lu] type 0->65282 已写入(KVC,第%ld个)", tag, (unsigned long)i, (long)gModelTypeHit]);
                         DYFlushLog();
                     } @catch (...) {}
                 }
@@ -539,8 +544,8 @@ static void DYBootAlert(void) {
         UIViewController *vc = DYTopVC();
         if (!vc) return;
         @try {
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v9 注入测试"
-                message:@"v8 只改 extraParams 不生效，v9 改 extraInfo 里 AWETextExtra.type=21。\n用抖音 @ 功能选一个人发评论，去网页端看是否变红。\n日志以 Documents/dyprobe_dump.txt 为准（剪贴板会被抖音覆盖）。"
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v10 注入测试"
+                message:@"关键修正：彩色字 type 是 65282 不是 21（网页脚本源码证实）。\n@人发评论，去网页端看是否变红。\n日志以 Documents/dyprobe_dump.txt 为准（剪贴板会被抖音覆盖）。"
                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ DYCopyToPasteboard(); }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleCancel handler:nil]];
@@ -556,7 +561,7 @@ __attribute__((constructor)) static void DYInit(void) {
         gOrigBySel = [NSMutableDictionary dictionary];
         gHookedKeys = [NSMutableSet set];
         gSeenHits = [NSMutableSet set];
-        DYAppend(@"DYProbe v9.1 init (extraParams 注入 + extraInfo.type 0->21 写入 + 抓真实红字模板对照)");
+        DYAppend(@"DYProbe v10 init (彩色字 type=65282,非21; extraParams+extraInfo 双注入)");
         DYFlushLog();
     }
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
