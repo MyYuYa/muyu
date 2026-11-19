@@ -1,608 +1,320 @@
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
-#import <dlfcn.h>
-#import <string.h>
-#import <stdlib.h>
-#import <mach/mach.h>
-#import <mach/vm_map.h>
-#import <unistd.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
+#import <objc/runtime.h>
+#import <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 /*
- * DYProbe v18 —— 全量调用索引 + 命中单独成档 + 存活心跳（只读，不改一个字节）
- * ============================================================================
- * v17 实测结论（用户日志，2026-11-20 00:23:26 会话，56 条记录）：
- *   安装正常（7 处 GOT），记录正常，但整段只有 1.9 秒：
- *       #1  +16ms   … #56 +1874ms   →  之后一条都没有
- *   且依旧 0 条 POST、0 次 tt21、0 次 text_extra。
- *   同一份日志顺带证明了两件事（这两条很关键，后面全靠它们）：
- *     a) POST 的 body 是明文 —— #40/#41 是 16384B + 8291B 纯 JSON
- *        （"fast"/"model_selector"/"nativeml"/"poi_shelf_preload_galileo"…），
- *        说明大 body 会被完整抄下来，评论 body 也是这个待遇。
- *     b) 请求头是 HPACK 压缩的 —— #1 帧头 00 0b 71 01 25（HEADERS/END_STREAM|
- *        END_HEADERS|PRIORITY, sid=0x3b），payload 以 80/92/82 这些索引字节开头，
- *        所以 :path 永远不可能是明文，别再指望搜 "comment/publish"。
+ * DYProbe v19 —— 参数层探针（不 hook 任何网络函数）
  *
- * v18 只补一个洞，但这个洞是致命的：**时间**。
- *   v17 只有相对毫秒、没有存活证据，无法区分「没发评论」和「抖音那一刻就没了」。
- *   → 每 10 秒打一行 `[v18] 存活 #n +XXs (HH:mm:ss) 调用 N 次 …`。
- *     下次日志最后一行如果是 +60s、+70s，就说明进程一直活着，
- *     那期间没有 POST 就是真的没发出去；如果停在 +2s，就是提前导出或被杀了。
- *   另外把 HTTP/2 帧头解析出来写进索引行（[DATA/sid15/f01] 这种），
- *   同一流上「先 HEADERS 后 DATA」＝ 一次带 body 的真正请求，更容易定位。
+ * 为什么换路：
+ *   v15~v18 一直在 hook SSL_write 抄明文。已证：这条路能抄到字节，但
+ *     (1) HTTP/2 的 :path 被 HPACK 压掉，comment/publish 明文字节流里根本不出现；
+ *     (2) 请求体可能被 zstd 压缩（v17 #52 实测 body 头 = 28 b5 2f fd），抄下来是密文；
+ *     (3) 最要命：我们要改的是「参数对象」，不是网络字节。
  *
- * 与 v15/v16/v17 相同的安全约束（这部分一行没动，是已经验证不崩的版本）：
- *   - 延迟 4 秒安装；只改 __DATA 段的 la_symbol_ptr 指针
- *   - 不 vm_protect、不扫 ObjC 类、不碰业务对象、不改 buffer、不改返回值
+ * 二进制里挖到的事实（抖音 41.0.0 AwemeCore）：
+ *   aweme/v1/comment/publish/?need_shark_async=1
+ *   AWECommentSwiftImpl.CommentPublishRequestProvider
+ *   AWEKMPBaseCommentPublishParameters (+Builder / +Companion)
+ *   独立字符串 "text_extra" 全二进制只有 1 处，且属于「评论列表响应模型」，
+ *   发布侧没有这个字面量 —— 它由 KMP 序列化层生成（属性 textExtra -> key text_extra），
+ *   与 translate 接口参数 comment_text_extra 同一命名规则。
+ *
+ * 而 v7 早就实测到：真正要发出去的发布参数字典是
+ *   AWECommentPublishParameterModel.extraParams
+ * （当时看到 author_secuid / common_flags / hashtag ...，但被 600 字符截断）
+ *
+ * 所以 v19 只做三件事，全部不碰网络：
+ *   1) 把 AWECommentPublishParameterModel 的属性表/方法表写进文件 —— 不发评论也有情报
+ *   2) 挂 extraParams 的 getter / setter，完整 dump 字典（不再截断到 600）
+ *   3) 影子注入：算出「如果把 type 改成 21 会长什么样」并写进日志，但**不改原对象**
+ *
+ * 日志：Documents/dyprobe_params.txt（每次写都 fflush，进程被杀也不丢）
  */
 
-/* ============================ 类型别名 ============================ */
-/* Apple SDK 里这些只是 struct 标签，没有同名 typedef，直接当类型名用会编译报错 */
-typedef struct mach_header_64      dy_mach_header_t;
-typedef struct segment_command_64  dy_segment_command_t;
-typedef struct section_64          dy_section_t;
-typedef struct nlist_64            dy_nlist_t;
+#define DY_MAXLEN  16000
+#define DY_LOGN    30          /* getter/setter 各最多详细记 30 次 */
 
-/* ============================ 日志基础设施 ============================ */
-static NSLock       *g_lock     = nil;
-static NSFileHandle *g_fh       = nil;    /* Documents/dyprobe_dump.txt  全量索引 */
-static NSFileHandle *g_hit      = nil;    /* Documents/dyprobe_hit.txt   只放命中 */
-static CFAbsoluteTime g_t0      = 0;
-static long long     g_dumpBytes = 0;
-static long long     g_hitBytes  = 0;
-static long long     g_bodyBytes = 0;     /* 正文抄写配额，防止日志写爆 */
-static int           g_bodyCount = 0;
-static BOOL          g_dumpFull  = NO;
-static BOOL          g_hitFull   = NO;
+static FILE  *g_fp     = NULL;
+static int    g_getN   = 0;
+static int    g_setN   = 0;
+static int    g_getLog = 0;
+static int    g_setLog = 0;
+static IMP    g_origGet = NULL;
+static IMP    g_origSet = NULL;
 
-static const long long kDumpFileCap = 3LL * 1024 * 1024;   /* 超过就重开一个空文件 */
-static const long long kHitFileCap  = 512LL * 1024;
-static const long long kBodyByteCap = 2LL * 1024 * 1024;   /* 本次会话正文最多抄 2MB */
-static const int       kBodyCountCap = 600;
-static const int       kBodyPerWrite = 8192;               /* 单段正文最多 8KB */
-static const int       kHitBodyMax   = 32768;              /* 命中段落最多 32KB */
-static const int       kSummaryCap   = 20000;              /* 索引最多记 2 万条 */
-
-static NSString *DYDoc(NSString *name) {
-    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    if (!doc) return nil;
-    return [doc stringByAppendingPathComponent:name];
+/* ------------------------------ 日志 ------------------------------ */
+static NSString *DYPath(void) {
+    NSString *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!d) return nil;
+    return [d stringByAppendingPathComponent:@"dyprobe_params.txt"];
 }
 
-static long long DYFileSize(NSString *p) {
-    if (!p) return 0;
-    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:NULL];
-    if (!a) return 0;
-    NSNumber *n = [a objectForKey:NSFileSize];
-    return n ? (long long)[n longLongValue] : 0;
-}
+static void L(NSString *fmt, ...) {
+    if (!fmt) return;
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (!s) return;
 
-static void DYLockInit(void) {
-    if (!g_lock) g_lock = [[NSLock alloc] init];
-}
-
-/*
- * 跨会话追加：文件小于上限就接着写（抖音被重启也不会冲掉已抓到的内容），
- * 超过上限才截断重来。
- */
-static void DYSetup(void) {
-    DYLockInit();
-    [g_lock lock];
-    @try {
-        NSString *pd = DYDoc(@"dyprobe_dump.txt");
-        NSString *ph = DYDoc(@"dyprobe_hit.txt");
-
-        if (pd) {
-            if (DYFileSize(pd) > kDumpFileCap) [[NSData data] writeToFile:pd atomically:YES];
-            if (![[NSFileManager defaultManager] fileExistsAtPath:pd]) [[NSData data] writeToFile:pd atomically:YES];
-            g_fh = [NSFileHandle fileHandleForWritingAtPath:pd];
-            @try { [g_fh seekToEndOfFile]; } @catch (...) {}
-            g_dumpBytes = DYFileSize(pd);
-        }
-        if (ph) {
-            if (DYFileSize(ph) > kHitFileCap) [[NSData data] writeToFile:ph atomically:YES];
-            if (![[NSFileManager defaultManager] fileExistsAtPath:ph]) [[NSData data] writeToFile:ph atomically:YES];
-            g_hit = [NSFileHandle fileHandleForWritingAtPath:ph];
-            @try { [g_hit seekToEndOfFile]; } @catch (...) {}
-            g_hitBytes = DYFileSize(ph);
-        }
-    } @catch (...) {
-    } @finally {
-        [g_lock unlock];
+    if (!g_fp) {
+        NSString *p = DYPath();
+        if (!p) return;
+        g_fp = fopen(p.fileSystemRepresentation, "a");
+        if (!g_fp) return;
     }
-}
-
-/* 内部：调用者已持锁。sync=YES 时强制落盘（只在命中时用，见下方说明） */
-static void DYAppendLocked(NSFileHandle *fh, NSString *s, BOOL toHit, BOOL sync) {
-    if (!fh || !s) return;
-    NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-    if (!d) return;
     @try {
-        [fh writeData:d];
-        /* 只在命中时 fsync。writeData 本身已经 write() 到内核，进程被杀（用户上滑杀进程）
-         * 数据不会丢；fsync 只防「掉电」。而 RTCLive 推流时 SSL_write 可能每秒几十次，
-         * 每次都 fsync 会把网络线程拖死、还会把日志瞬间写满 —— 所以默认不同步。 */
-        if (sync) [fh synchronizeFile];
+        NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+        if (d && d.length) {
+            fwrite(d.bytes, 1, d.length, g_fp);
+            fflush(g_fp);          /* 关键：不用等 fsync，内核已可见 */
+        }
     } @catch (...) {}
-    if (toHit) g_hitBytes += (long long)d.length;
-    else       g_dumpBytes += (long long)d.length;
 }
 
-static void DYAppend(NSString *s) {
-    if (!s) return;
-    DYLockInit();
-    [g_lock lock];
+static NSString *DYStr(id o) {
+    if (!o) return @"(nil)";
+    NSString *s = nil;
     @try {
-        if (!g_dumpFull && g_dumpBytes + (long long)[s length] > kDumpFileCap + (512 * 1024)) {
-            g_dumpFull = YES;
-            DYAppendLocked(g_fh, @"[v18] 索引已达上限，后续不再写索引", NO, YES);
+        if ([o isKindOfClass:[NSString class]]) {
+            s = (NSString *)o;
+        } else if ([o isKindOfClass:[NSNumber class]]) {
+            s = [o description];
+        } else if ([NSJSONSerialization isValidJSONObject:o]) {
+            NSData *d = [NSJSONSerialization dataWithJSONObject:o options:0 error:NULL];
+            if (d) s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
         }
-        if (!g_dumpFull) DYAppendLocked(g_fh, s, NO, NO);
+        if (!s) s = [o description];
     } @catch (...) {
-    } @finally {
-        [g_lock unlock];
+        s = @"(dump 抛异常)";
     }
+    if (!s) s = @"(nil)";
+    if (s.length > DY_MAXLEN) s = [[s substringToIndex:DY_MAXLEN] stringByAppendingString:@"…<已截断>"];
+    return s;
 }
 
-static void DYAppendHit(NSString *s) {
-    if (!s) return;
-    DYLockInit();
-    [g_lock lock];
-    @try {
-        if (!g_hitFull && g_hitBytes > kHitFileCap) {
-            g_hitFull = YES;
-            DYAppendLocked(g_hit, @"[v18] 命中档已达上限，后续不再写", YES, YES);
-        }
-        if (!g_hitFull) DYAppendLocked(g_hit, s, YES, YES);
-    } @catch (...) {
-    } @finally {
-        [g_lock unlock];
+/* --------------------------- 类结构导出 --------------------------- */
+static void DYDumpClass(Class c, const char *tag) {
+    if (!c) { L(@"[%s] 类不存在", tag); return; }
+    L(@"\n---- 类 %s ----", class_getName(c));
+
+    unsigned int pn = 0;
+    objc_property_t *ps = class_copyPropertyList(c, &pn);
+    NSMutableArray *pa = [NSMutableArray array];
+    for (unsigned int i = 0; i < pn; i++) {
+        const char *nm = property_getName(ps[i]);
+        const char *at = property_getAttributes(ps[i]);
+        if (nm) [pa addObject:[NSString stringWithFormat:@"%s(%s)", nm, at ? at : "?"]];
     }
+    if (ps) free(ps);
+    L(@"[属性 %u 个] %@", pn, [pa componentsJoinedByString:@", "]);
+
+    unsigned int mn = 0;
+    Method *ms = class_copyMethodList(c, &mn);
+    NSMutableArray *ma = [NSMutableArray array];
+    for (unsigned int i = 0; i < mn && i < 150; i++) {
+        const char *sn = sel_getName(method_getName(ms[i]));
+        const char *te = method_getTypeEncoding(ms[i]);
+        if (sn) [ma addObject:[NSString stringWithFormat:@"%s [%s]", sn, te ? te : "?"]];
+    }
+    if (ms) free(ms);
+    L(@"[方法 %u 个] %@", mn, [ma componentsJoinedByString:@", "]);
+    L(@"----------------");
 }
 
-/* ============================ 小工具 ============================ */
-static const void *dy_memmem(const void *h, size_t hl, const void *n, size_t nl) {
-    if (!h || !n || nl == 0 || hl < nl) return NULL;
-    const unsigned char *p = (const unsigned char *)h;
-    const unsigned char *last = p + (hl - nl);
-    unsigned char first = *(const unsigned char *)n;
-    while (p <= last) {
-        if (*p == first && memcmp(p, n, nl) == 0) return p;
-        p++;
-    }
-    return NULL;
-}
-
-static BOOL dy_has(const unsigned char *p, int n, const char *kw) {
-    if (!p || n <= 0 || !kw) return NO;
-    size_t kl = strlen(kw);
-    if (kl == 0 || (size_t)n < kl) return NO;
-    return dy_memmem(p, (size_t)n, kw, kl) != NULL;
-}
-
-/* 可打印占比（0~100），换行/回车/制表算可打印（HTTP 头都是这种） */
-static int dy_ratio(const unsigned char *p, int n) {
-    if (!p || n <= 0) return 0;
-    int good = 0;
-    for (int i = 0; i < n; i++) {
-        unsigned char c = p[i];
-        if ((c >= 32 && c < 127) || c == '\n' || c == '\r' || c == '\t') good++;
-    }
-    return good * 100 / n;
-}
-
-/* 单行 ASCII 预览：换行压成空格，不可打印转 '.' */
-static NSString *dy_line(const unsigned char *p, int n, int maxLen) {
-    if (!p || n <= 0) return @"";
-    int lim = (n < maxLen) ? n : maxLen;
-    NSMutableString *ms = [NSMutableString stringWithCapacity:(NSUInteger)lim + 8];
-    for (int i = 0; i < lim; i++) {
-        unsigned char c = p[i];
-        if (c == '\n' || c == '\r' || c == '\t') [ms appendString:@" "];
-        else if (c >= 32 && c < 127) [ms appendFormat:@"%c", c];
-        else [ms appendString:@"."];
-    }
-    return ms;
-}
-
-/* 十六进制前缀：用来读 HTTP/2 帧头 9 字节（len3 + type + flags + streamid4） */
-static NSString *dy_hex(const unsigned char *p, int n, int maxBytes) {
-    if (!p || n <= 0) return @"";
-    int lim = (n < maxBytes) ? n : maxBytes;
-    NSMutableString *ms = [NSMutableString stringWithCapacity:(NSUInteger)lim * 3 + 4];
-    for (int i = 0; i < lim; i++) {
-        if (i) [ms appendString:@" "];
-        [ms appendFormat:@"%02x", p[i]];
-    }
-    return ms;
-}
-
-/*
- * 解析 HTTP/2 帧头（9 字节：length3 + type1 + flags1 + streamid4）。
- * 只认「这一笔写入正好从一个帧头开始」且长度自洽的情况，否则返回 nil。
- * 有了它，索引行就能直接写出 HEADERS / DATA / WINDOW_UPDATE 和流号，
- * 一眼能看出「同一流上先 HEADERS 后 DATA」= 一次真正的请求（含 body）。
- */
-static NSString *dy_h2frame(const unsigned char *p, int n, const char **kindOut) {
-    if (!p || n < 9) return nil;
-    unsigned len = ((unsigned)p[0] << 16) | ((unsigned)p[1] << 8) | (unsigned)p[2];
-    unsigned typ = (unsigned)p[3];
-    unsigned flg = (unsigned)p[4];
-    unsigned sid = (((unsigned)(p[5] & 0x7f)) << 24) | ((unsigned)p[6] << 16) |
-                   ((unsigned)p[7] << 8) | (unsigned)p[8];
-    if (typ > 0x09) return nil;                 /* 只认标准帧型 */
-    if (len + 9 > (unsigned)n) return nil;      /* 必须是完整帧 */
-    /* 有流号的帧型，sid 不能是 0；0 号流只允许 SETTINGS/WINDOW_UPDATE/PING/GOAWAY/WUPD */
-    if (sid == 0 && (typ == 0x00 || typ == 0x01 || typ == 0x02 ||
-                     typ == 0x03 || typ == 0x05 || typ == 0x09)) return nil;
-
-    const char *name = "?";
-    switch (typ) {
-        case 0x00: name = "DATA";  break;
-        case 0x01: name = "HEADER"; break;
-        case 0x02: name = "PRIO";  break;
-        case 0x03: name = "RST";   break;
-        case 0x04: name = "WND";   break;
-        case 0x05: name = "PUSH";  break;
-        case 0x06: name = "PING";  break;
-        case 0x07: name = "GOAWAY"; break;
-        case 0x08: name = "WUPD";  break;
-        case 0x09: name = "CONT";  break;
-    }
-    if (kindOut) *kindOut = name;
-
-    NSMutableString *f = [NSMutableString stringWithCapacity:24];
-    [f appendFormat:@"%@/sid%u/f%02x", [NSString stringWithUTF8String:name], sid, flg];
-    return f;
-}
-
-/* 多行正文：可打印保留，\r 写成 \\r，其余转 '.'（与 v16 一致，便于肉眼比对） */static NSString *dy_text(const unsigned char *p, int n) {
-    if (!p || n <= 0) return @"";
-    NSMutableString *ms = [NSMutableString stringWithCapacity:(NSUInteger)n + 32];
-    for (int i = 0; i < n; i++) {
-        unsigned char c = p[i];
-        if (c == '\n')      [ms appendString:@"\n"];
-        else if (c == '\r') [ms appendString:@"\\r"];
-        else if (c == '\t') [ms appendString:@"\\t"];
-        else if (c >= 32 && c < 127) [ms appendFormat:@"%c", c];
-        else                [ms appendString:@"."];
-    }
-    return ms;
-}
-
-/* ============================ 分类与命中判定 ============================ */
-static void dy_classify(const unsigned char *p, int n, const char **tagOut, BOOL *isGetOut) {
-    BOOL isGet = NO;
-    const char *tag = "BIN";
-
-    if (n >= 4 && memcmp(p, "GET ", 4) == 0)        { isGet = YES; tag = "GET"; }
-    else if (n >= 5 && memcmp(p, "POST ", 5) == 0)  { tag = "POST"; }
-    else if (n >= 4 && memcmp(p, "PUT ", 4) == 0)   { tag = "PUT"; }
-    else if (n >= 14 && memcmp(p, "PRI * HTTP/2.0", 14) == 0) { tag = "H2PRE"; }
-    else {
-        int r = dy_ratio(p, n);
-        if (r >= 92) tag = "TXT";
-        else if (r >= 55) tag = "MIX";
-        else tag = "BIN";
-    }
-    *tagOut = tag;
-    *isGetOut = isGet;
-}
-
-/* 命中 = 出现下面任何一条。命中段会整段抄进 dyprobe_hit.txt */
-static BOOL dy_isHit(const unsigned char *p, int n) {
-    if (!p || n <= 0) return NO;
-    static const char *kws[] = {
-        "POST ",                  /* 任何 POST 都记：评论发布一定是 POST */
-        "text_extra",             /* 目标字段 */
-        "comment/publish",        /* 评论发布路径 */
-        "aweme/v1/comment",
-        "\"text\"",
-        "reply_id",
-        "tt21",                   /* 用户测试串 */
-        "multipart/form-data",
-        "x-www-form-urlencoded",
-        "X-SS-STUB",              /* TTNet 签名头 */
-        "X-Gorgon",
-    };
-    for (size_t i = 0; i < sizeof(kws) / sizeof(kws[0]); i++) {
-        if (dy_has(p, n, kws[i])) return YES;
-    }
-    return NO;
-}
-
-/* ============================ 核心：SSL_write ============================ */
-typedef int (*dy_ssl_write_t)(void *ssl, const void *buf, int num);
-static dy_ssl_write_t orig_SSL_write = NULL;
-
-static volatile int       g_calls = 0;
-static volatile long long g_bytes = 0;
-static volatile int       g_hits  = 0;
-static volatile int       g_posts = 0;
-
-static void dy_record(int idx, const void *buf, int len) {
-    const unsigned char *p = (const unsigned char *)buf;
-
-    const char *tag = "BIN";
-    BOOL isGet = NO;
-    dy_classify(p, len, &tag, &isGet);
-
-    BOOL hit = dy_isHit(p, len);
-    if (hit) __sync_add_and_fetch(&g_hits, 1);
-    /* 计数用 dy_has：HTTP/2 下请求行被 HPACK 压掉了，不能只看开头是不是 "POST " */
-    if (strcmp(tag, "POST") == 0 || dy_has(p, len, "POST ")) __sync_add_and_fetch(&g_posts, 1);
-
-    long long ms = (long long)((CFAbsoluteTimeGetCurrent() - g_t0) * 1000.0);
-    if (ms < 0) ms = 0;
-
-    /* 硬闸：超过 20000 次调用后只留命中段，防止推流类流量把索引刷爆 */
-    if (!hit && idx > kSummaryCap) return;
-
-    /* 每一行索引：序号 / 相对毫秒 / 长度 / 类型 / 帧信息 / ASCII 预览 */
-    NSString *frame = dy_h2frame(p, len, NULL);
-
-    NSMutableString *s = [NSMutableString stringWithCapacity:256];
-    [s appendFormat:@"#%d +%lldms %dB %s%@", idx, ms, len, tag, hit ? @"  ★HIT" : @""];
-    if (frame) [s appendFormat:@" [%@]", frame];
-    [s appendFormat:@"\n    a=\"%@\"", dy_line(p, len, 150)];
-    if (strcmp(tag, "BIN") == 0 || strcmp(tag, "H2PRE") == 0) {
-        [s appendFormat:@"\n    h=\"%@\"", dy_hex(p, len, 24)];
-    }
-    DYAppend(s);
-
-    /* 正文：命中段落一定抄；非 GET 的小包也抄（评论 body 就在这个量级） */
-    BOOL wantBody = hit || (!isGet && len <= kBodyPerWrite);
-    BOOL bodyRoom = (g_bodyCount < kBodyCountCap && g_bodyBytes < kBodyByteCap);
-
-    if (wantBody && bodyRoom) {
-        int lim = len;
-        if (lim > kBodyPerWrite) lim = kBodyPerWrite;
-        NSString *body = dy_text(p, lim);
-
-        NSMutableString *blk = [NSMutableString stringWithCapacity:(NSUInteger)lim + 256];
-        [blk appendFormat:@"----- BODY #%d (%dB, %s)%@ -----\n", idx, len, tag, hit ? @" ★HIT" : @""];
-        [blk appendString:body];
-        if (len > lim) [blk appendFormat:@"\n...[正文截断，原长 %d 字节]...", len];
-        [blk appendString:@"\n----- END BODY -----"];
-        DYAppend(blk);
-
-        g_bodyCount++;
-        g_bodyBytes += lim;
-    }
-
-    /* 命中档不参与上面的配额：它是唯一要拿出去看的东西，必须写进去 */
-    if (hit) {
-        int hlim = (len < kHitBodyMax) ? len : kHitBodyMax;
-        NSMutableString *hb = [NSMutableString stringWithCapacity:(NSUInteger)hlim + 320];
-        [hb appendFormat:@"\n@@@@@ HIT #%d +%lldms %dB %s @@@@@\n", idx, ms, len, tag];
-        [hb appendString:@"hex: "];
-        [hb appendString:dy_hex(p, hlim, 32)];
-        [hb appendString:@"\n--- text ---\n"];
-        [hb appendString:dy_text(p, hlim)];
-        if (len > hlim) [hb appendFormat:@"\n...[截断，原长 %d 字节]...", len];
-        [hb appendString:@"\n@@@@@ END HIT @@@@@"];
-        DYAppendHit(hb);
-    }
-}
-
-static int dy_SSL_write(void *ssl, const void *buf, int num) {
-    int c = __sync_add_and_fetch(&g_calls, 1);
-
-    if (c == 1 || (c % 200) == 0) {
-        DYAppend([NSString stringWithFormat:
-                  @"[v18] 心跳：调用 %d 次 / 累计 %lld 字节 / 命中 %d / POST %d",
-                  c, (long long)g_bytes, g_hits, g_posts]);
-    }
-
-    if (buf && num > 0) {
-        g_bytes += num;
-        @try { dy_record(c, buf, num); } @catch (...) {}
-    }
-
-    if (orig_SSL_write) return orig_SSL_write(ssl, buf, num);
-    return -1;
-}
-
-/* ============================ fishhook（自实现，逻辑与 v15/v16 一致） ============================ */
-struct dy_rebinding { const char *name; void *replacement; };
-
-static struct dy_rebinding g_rb[] = {
-    { "SSL_write", (void *)dy_SSL_write },
-};
-static const size_t g_rb_n = sizeof(g_rb) / sizeof(g_rb[0]);
-static int g_replaced = 0;
-
-static BOOL dy_name_match(const char *symname) {
-    if (!symname || !symname[0] || !symname[1]) return NO;
-    const char *shortname = symname + 1;   /* 跳过前导 '_' */
-    for (size_t i = 0; i < g_rb_n; i++) {
-        if (strcmp(shortname, g_rb[i].name) == 0) return YES;
-    }
-    return NO;
-}
-
-static void dy_rebind_section(dy_section_t *sect, intptr_t slide,
-                              dy_nlist_t *symtab, char *strtab, uint32_t *indirect) {
-    if ((sect->flags & SECTION_TYPE) != S_NON_LAZY_SYMBOL_POINTERS &&
-        (sect->flags & SECTION_TYPE) != S_LAZY_SYMBOL_POINTERS) return;
-
-    size_t cnt = sect->size / sizeof(void *);
-    if (cnt == 0) return;
-    void **bindings = (void **)((uintptr_t)slide + sect->addr);
-    uint32_t *indices = indirect + sect->reserved1;
-
-    /* 先探一遍：这段里有没有目标符号。没有就完全不动内存 */
-    BOOL hit = NO;
-    for (size_t k = 0; k < cnt; k++) {
-        uint32_t si = indices[k];
-        if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL ||
-            si == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
-        if (dy_name_match(strtab + symtab[si].n_un.n_strx)) { hit = YES; break; }
-    }
-    if (!hit) return;
-
-    /* 目标符号位于 __DATA,__la_symbol_ptr，该段本身可写，直接改指针即可 */
-    for (size_t k = 0; k < cnt; k++) {
-        uint32_t si = indices[k];
-        if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL ||
-            si == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
-        if (!dy_name_match(strtab + symtab[si].n_un.n_strx)) continue;
-        for (size_t r = 0; r < g_rb_n; r++) {
-            if (strcmp(strtab + symtab[si].n_un.n_strx + 1, g_rb[r].name) == 0) {
-                if (bindings[k] != g_rb[r].replacement) {
-                    bindings[k] = g_rb[r].replacement;
-                    g_replaced++;
-                }
-            }
-        }
-    }
-}
-
-static void dy_rebind_image(const struct mach_header *header, intptr_t slide) {
-    const dy_mach_header_t *mh = (const dy_mach_header_t *)header;
-    if (!mh || mh->magic != MH_MAGIC_64) return;
-
-    dy_segment_command_t *linkedit = NULL;
-    struct symtab_command *stcmd = NULL;
-    struct dysymtab_command *dstcmd = NULL;
-
-    uintptr_t cur = (uintptr_t)header + sizeof(dy_mach_header_t);
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        dy_segment_command_t *seg = (dy_segment_command_t *)cur;
-        if (seg->cmdsize == 0) break;
-        if (seg->cmd == LC_SEGMENT_64 && strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit = seg;
-        else if (seg->cmd == LC_SYMTAB)   stcmd  = (struct symtab_command *)seg;
-        else if (seg->cmd == LC_DYSYMTAB) dstcmd = (struct dysymtab_command *)seg;
-        cur += seg->cmdsize;
-    }
-    if (!linkedit || !stcmd || !dstcmd || dstcmd->nindirectsyms == 0) return;
-
-    uintptr_t base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
-    dy_nlist_t *symtab = (dy_nlist_t *)(base + stcmd->symoff);
-    char *strtab = (char *)(base + stcmd->stroff);
-    uint32_t *indirect = (uint32_t *)(base + dstcmd->indirectsymoff);
-
-    cur = (uintptr_t)header + sizeof(dy_mach_header_t);
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        dy_segment_command_t *seg = (dy_segment_command_t *)cur;
-        if (seg->cmdsize == 0) break;
-        cur += seg->cmdsize;
-        if (seg->cmd != LC_SEGMENT_64) continue;
-        /* 只处理 __DATA（RW 可写段）。实测 AwemeCore 无 __DATA_CONST */
-        if (strcmp(seg->segname, SEG_DATA) != 0) continue;
-        dy_section_t *sect = (dy_section_t *)((uintptr_t)seg + sizeof(dy_segment_command_t));
-        for (uint32_t j = 0; j < seg->nsects; j++, sect++) {
-            dy_rebind_section(sect, slide, symtab, strtab, indirect);
-        }
-    }
-}
-
-/* ============================ 存活心跳（时间维度） ============================ */
-/*
- * v17 的日志只有「相对毫秒」，看不出进程到底活了多久。
- * 2026-11-20 00:23 那次 56 条记录全在 +1.9 秒内就结束了，
- * 无法区分「没发评论」和「抖音那一刻就没了」——这是 v18 要补的第一个洞。
- * 改成每 10 秒一行，日志自己就能证明活到了第几秒。
- */
-static dispatch_source_t g_timer = nil;
-static volatile int      g_tick  = 0;
-
-static void dy_timer_tick(void) {
-    int t = __sync_add_and_fetch(&g_tick, 1);
-    long long el = (long long)(CFAbsoluteTimeGetCurrent() - g_t0);
-    if (el < 0) el = 0;
-
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    [df setDateFormat:@"HH:mm:ss"];
-    NSString *ts = [df stringFromDate:[NSDate date]] ?: @"?";
-
-    NSString *line = [NSString stringWithFormat:
-                      @"[v18] 存活 #%d +%llds (%@) 调用 %d 次 / %lld 字节 / 命中 %d / POST %d%@",
-                      t, el, ts, g_calls, (long long)g_bytes, g_hits, g_posts,
-                      (g_hits > 0) ? @"  ← 有命中，导出 dyprobe_hit.txt" : @""];
-    DYAppend(line);
-}
-
-static void dy_start_timer(void) {
-    if (g_timer) return;
-    g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                     dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
-    if (!g_timer) return;
-    dispatch_source_set_timer(g_timer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
-                              (uint64_t)(10.0 * NSEC_PER_SEC),
-                              (uint64_t)(1.0 * NSEC_PER_SEC));
-    dispatch_source_set_event_handler(g_timer, ^{
-        @autoreleasepool {
-            @try { dy_timer_tick(); } @catch (...) {}
-        }
-    });
-    dispatch_resume(g_timer);
-}
-
-/* ============================ 安装（延迟执行） ============================ */
-static void dy_install(void) {
-    g_t0 = CFAbsoluteTimeGetCurrent();
-    DYSetup();
-
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    [df setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
-    NSString *ts = [df stringFromDate:[NSDate date]] ?: @"?";
-
-    DYAppend([NSString stringWithFormat:
-              @"\n\n========== [v18] 会话开始 %@ ==========", ts]);
-    DYAppendHit([NSString stringWithFormat:
-                 @"\n\n========== [v18] 会话开始 %@ ==========", ts]);
-
-    void *p = dlsym(RTLD_DEFAULT, "SSL_write");
-    if (!p) {
-        DYAppend(@"[v18] dlsym SSL_write = NULL（boringssl 未加载），放弃安装");
+/* --------------------------- 影子注入 --------------------------- */
+static void DYShadow(id dict, NSString *tag) {
+    if (![dict isKindOfClass:[NSDictionary class]]) {
+        L(@"[SHADOW %@] 不是字典，实际类型 %@", tag, NSStringFromClass([dict class]));
         return;
     }
-    orig_SSL_write = (dy_ssl_write_t)p;
-    DYAppend([NSString stringWithFormat:@"[v18] dlsym SSL_write = %p", p]);
+    NSDictionary *d = (NSDictionary *)dict;
+    NSArray *keys = [[d allKeys] sortedArrayUsingSelector:@selector(compare:)];
+    L(@"[KEYS %@] %@", tag, [keys componentsJoinedByString:@", "]);
 
-    uint32_t total = _dyld_image_count();
-    uint32_t scanned = 0;
-    for (uint32_t i = 0; i < total; i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if (!nm) continue;
-        /* 跳过系统库：只关心 App 自己的 image，减少无关内存操作 */
-        if (strncmp(nm, "/usr/lib/", 9) == 0) continue;
-        if (strncmp(nm, "/System/Library/", 16) == 0) continue;
-        if (strncmp(nm, "/System/Cryptexes/", 18) == 0) continue;
-        int before = g_replaced;
-        dy_rebind_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
-        if (g_replaced != before) {
-            DYAppend([NSString stringWithFormat:@"[v18] 命中 image: %s（改写 %d 处）", nm, g_replaced - before]);
-        }
-        scanned++;
-    }
-    DYAppend([NSString stringWithFormat:@"[v18] 安装完成：扫描 %u/%u 个非系统 image，改写 GOT %d 处",
-              scanned, total, g_replaced]);
+    id te = [d objectForKey:@"text_extra"];
+    if (!te) te = [d objectForKey:@"textExtra"];
+    if (!te) te = [d objectForKey:@"text_extras"];
+    if (!te) te = [d objectForKey:@"textExtras"];
+    L(@"[TEXT_EXTRA %@] %@", tag, DYStr(te));
 
-    if (g_replaced == 0) {
-        DYAppend(@"[v18] 注意：改写 0 处 → hook 未生效，抓不到数据但不影响 App");
-    } else {
-        DYAppend(@"[v18] 装好了。每 10 秒会打一行「存活 #n」，它就是时间证据");
-        DYAppend(@"[v18] 步骤：① 等 20 秒 ② 进视频评论区发 tt21 ③ 看到“评论成功” ④ 再等 10 秒 ⑤ 杀进程导出");
-        DYAppend(@"[v18] 索引 Documents/dyprobe_dump.txt；命中段 Documents/dyprobe_hit.txt");
-    }
-    dy_start_timer();
-}
+    id txt = [d objectForKey:@"text"];
+    if (!txt) txt = [d objectForKey:@"content"];
+    L(@"[TEXT %@] %@", tag, DYStr(txt));
 
-__attribute__((constructor)) static void DYInit(void) {
-    /* 不在 constructor 里立刻动手：那一刻各 image 仍在加载，
-     * 遍历它们做符号解析容易读到未就绪的数据（v14 崩在这个阶段）。
-     * 延后 4 秒，等 App 启动稳定、各 image 的 __DATA 已就绪后再改。 */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            @try { dy_install(); } @catch (...) {
-                DYAppend(@"[v18] 安装异常，已忽略");
+    /* 算出「注入 type=21 之后」的样子，只打印，不改真对象 */
+    NSMutableArray *out = [NSMutableArray array];
+    if ([te isKindOfClass:[NSArray class]]) {
+        for (id e in (NSArray *)te) {
+            if ([e isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *m = [(NSDictionary *)e mutableCopy];
+                m[@"type"] = @21;
+                [out addObject:m];
             }
         }
+    }
+    if (out.count == 0 && [txt isKindOfClass:[NSString class]] && [(NSString *)txt length] > 0) {
+        [out addObject:@{ @"start": @0,
+                          @"end":   @([(NSString *)txt length]),
+                          @"type":  @21,
+                          @"user_id": @"" }];
+    }
+    L(@"[SHADOW %@] 若注入 type=21 -> %@", tag, DYStr(out));
+}
+
+/* ----------------------------- hook ----------------------------- */
+static id dy_get(id self, SEL _cmd) {
+    id r = nil;
+    if (g_origGet) {
+        @try { r = ((id (*)(id, SEL))g_origGet)(self, _cmd); } @catch (...) {}
+    }
+    g_getN++;
+    if (g_getLog < DY_LOGN) {
+        g_getLog++;
+        @try {
+            L(@"[GET #%d] -[%@ %@] = %@", g_getN,
+              NSStringFromClass([self class]), NSStringFromSelector(_cmd), DYStr(r));
+            DYShadow(r, [NSString stringWithFormat:@"get#%d", g_getN]);
+        } @catch (...) {}
+    }
+    return r;
+}
+
+static void dy_set(id self, SEL _cmd, id v) {
+    g_setN++;
+    if (g_setLog < DY_LOGN) {
+        g_setLog++;
+        @try {
+            L(@"[SET #%d] -[%@ %@] <=\n%@", g_setN,
+              NSStringFromClass([self class]), NSStringFromSelector(_cmd), DYStr(v));
+            DYShadow(v, [NSString stringWithFormat:@"set#%d", g_setN]);
+        } @catch (...) {}
+    }
+    if (g_origSet) {
+        @try { ((void (*)(id, SEL, id))g_origSet)(self, _cmd, v); } @catch (...) {}
+    }
+}
+
+static BOOL DYHookSel(Class c, const char *selName, BOOL isSetter) {
+    SEL s = sel_registerName(selName);
+    Method m = class_getInstanceMethod(c, s);
+    if (!m) return NO;
+
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc) return NO;
+
+    /* 统计 '@' 个数：setter 形如 v24@0:8@16 / v@:@，必然有两个 '@'（self + 参数） */
+    int at = 0;
+    for (const char *q = enc; *q; q++) if (*q == '@') at++;
+
+    if (isSetter) {
+        if (enc[0] != 'v' || at < 2) {
+            L(@"[SKIP] setter %s 签名 %s 不是对象入参，跳过（不乱挂）", selName, enc);
+            return NO;
+        }
+        g_origSet = method_setImplementation(m, (IMP)dy_set);
+        L(@"[HOOK] setter %s 已挂 (enc=%s)", selName, enc);
+        return g_origSet != NULL;
+    }
+
+    if (!(enc[0] == '@' && enc[1] == '@' && enc[2] == ':')) {
+        L(@"[SKIP] getter %s 签名 %s 不是 @@:，跳过", selName, enc);
+        return NO;
+    }
+    g_origGet = method_setImplementation(m, (IMP)dy_get);
+    L(@"[HOOK] getter %s 已挂 (enc=%s)", selName, enc);
+    return g_origGet != NULL;
+}
+
+static void DYInstall(void) {
+    /* 先无条件把 KMP 那层的参数类结构抄下来：不发评论也能拿到字段名 */
+    @try {
+        Class k = objc_getClass("AWEKMPBaseCommentPublishParameters");
+        if (k) DYDumpClass(k, "KMPBaseCommentPublishParameters");
+        else L(@"[MISS] AWEKMPBaseCommentPublishParameters 不存在");
+        Class kb = objc_getClass("AWEKMPBaseCommentPublishParametersBuilder");
+        if (kb) DYDumpClass(kb, "KMPBaseCommentPublishParametersBuilder");
+    } @catch (...) {}
+
+    static const char *cands[] = {
+        "AWECommentPublishParameterModel",
+        "AWECommentPublishParams",
+        "AWECommentPublishParameter",
+        "AWECommentPublishParamModel",
+    };
+    Class c = Nil;
+    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
+        c = objc_getClass(cands[i]);
+        if (c) { L(@"[FOUND] 命中类名 %s", cands[i]); break; }
+    }
+    if (!c) {
+        L(@"[MISS] 上面几个类名都不存在。下面列出运行时所有含 CommentPublish 的类：");
+        int n = objc_getClassList(NULL, 0);
+        if (n > 0) {
+            Class *all = (Class *)calloc((size_t)n, sizeof(Class));
+            if (all) {
+                n = objc_getClassList(all, n);
+                NSMutableArray *hit = [NSMutableArray array];
+                for (int i = 0; i < n; i++) {
+                    const char *nm = class_getName(all[i]);
+                    if (nm && (strstr(nm, "CommentPublish") || strstr(nm, "PublishParameter"))) {
+                        [hit addObject:[NSString stringWithUTF8String:nm]];
+                    }
+                }
+                free(all);
+                L(@"[CANDIDATES] %@", [hit componentsJoinedByString:@", "]);
+            }
+        }
+        return;
+    }
+
+    DYDumpClass(c, "PublishParameterModel");
+
+    BOOL ok = NO;
+    if (DYHookSel(c, "extraParams", NO)) ok = YES;
+    if (DYHookSel(c, "setExtraParams:", YES)) ok = YES;
+
+    /* 兜底：按属性名找其它含 extra 的 getter */
+    if (!ok) {
+        unsigned int pn = 0;
+        objc_property_t *ps = class_copyPropertyList(c, &pn);
+        for (unsigned int i = 0; i < pn; i++) {
+            const char *nm = property_getName(ps[i]);
+            if (!nm) continue;
+            if (strstr(nm, "extra") || strstr(nm, "Extra")) {
+                if (DYHookSel(c, nm, NO)) ok = YES;
+                char setter[256];
+                snprintf(setter, sizeof(setter), "set%c%s:", toupper((unsigned char)nm[0]), nm + 1);
+                DYHookSel(c, setter, YES);
+            }
+        }
+        if (ps) free(ps);
+    }
+    L(@"[%@] 结果：%@", ok ? @"OK" : @"FAIL", ok ? @"已挂上发布参数钩子" : @"没找到可挂的方法");
+}
+
+/* ----------------------------- 入口 ----------------------------- */
+__attribute__((constructor)) static void DYInit(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            L(@"\n\n========== [v19] 会话开始 %@ ==========", [NSDate date]);
+            L(@"[v19] 本版不 hook 任何网络函数，评论该发得出去");
+            @try { DYInstall(); } @catch (...) { L(@"[v19] 安装异常，已忽略"); }
+            L(@"[v19] 就绪：进视频评论区发一条 tt21，看到“评论成功”后杀进程导出本文件");
+            L(@"[v19] 文件：Documents/dyprobe_params.txt");
+        }
     });
+
+    for (int i = 1; i <= 3; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 15.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            @autoreleasepool {
+                L(@"[心跳 %ds] 活着 / getter %d 次 / setter %d 次", i * 15, g_getN, g_setN);
+            }
+        });
+    }
 }
