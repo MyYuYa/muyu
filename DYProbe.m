@@ -5,33 +5,42 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
 /*
- * DYProbe v20 —— 加载信标 + 参数层探针
+ * DYProbe v21
  *
- * v19 的致命设计缺陷（本轮教训）：
- *   唯一的"我加载了"证据，写在 constructor 里 dispatch_after(+3s) 的块中。
- *   块没跑到（App 在 3 秒内崩、或 dylib 根本没进包）→ 一个字节都不留，
- *   于是无法区分「没加载」和「加载了但没干活」。这不是探针，是盲猜。
+ * v20 实测结果（2026-11-20 01:08）暴露的三个问题，本版逐个修：
  *
- * v20 的硬要求：**constructor 第一行就必须落盘**，且满足：
- *   1) 纯 C（getenv + fopen + fprintf），不碰 Foundation —— 不依赖任何初始化顺序
- *   2) 不依赖 dispatch —— dispatch_after 万一不触发也有证据
- *   3) 一次写 3 个路径（Documents ×2 + TMPDIR），任一存在即可读到
- *   4) 写失败不 return，继续走后面的流程
+ *  ① getter 一个都没挂上：
+ *     [SKIP] getter extraParams 签名 @16@0:8 不是 @@:
+ *     arm64 的 getter type encoding 是 `@16@0:8`（带偏移），不是 `@@:`
+ *     → 改成 method_getNumberOfArguments + method_getReturnType 判断，不再猜字符串
  *
- * 之后的逻辑与 v19 一致：不 hook 任何网络函数（HTTP/3 QUIC，hook SSL_write 无效已证），
- * 只抄 AWEKMPBaseCommentPublishParameters 的结构 + 挂 extraParams 全量 dump。
+ *  ② AWEKMPBaseCommentPublishParameters 属性 0 / 方法 0：
+ *     它是 Kotlin Multiplatform 类，字段定义在父类，class_copyMethodList 只返回本层
+ *     → 新增 dump 父类链（最多 4 层）+ 类方法（KMP 枚举的 values 在类方法上）
+ *
+ *  ③ 发布链路的关键类只 dump 不 hook：
+ *     AWECommentPublishParameterModel.extraParams 是 NSDictionary（v7 早就在这看到过真实参数）
+ *     AWECommentInputContentModel 才是装正文 + text_extra 的地方
+ *     AWECommentSwiftImpl.CommentPublishRequestProvider 是组请求的那一层
+ *     → 全部挂上，取到真实数据
+ *
+ * 仍然不 hook 任何网络函数（HTTP/3 QUIC，hook SSL_write 无效，已证）。
  */
 
-#define DY_MAXLEN  16000
-#define DY_LOGN    30
-#define DY_BEACON  "[v20]"
+#define DY_MAXLEN   12000
+#define DY_LOGN     24
+#define DY_MAXLINE  1200          /* 全文件行数上限，防止日志爆炸拖死 IO */
+#define DY_BEACON   "[v21]"
 
-static int g_getN = 0, g_setN = 0, g_getLog = 0, g_setLog = 0;
-static IMP g_origGet = NULL, g_origSet = NULL;
+static int g_writes = 0;
+
+/* hook 可能被多个线程同时进入：计数器和文件写都必须互斥，否则随机崩 */
+static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* ===================== 信标：纯 C，constructor 可用 ===================== */
 static void DYBeacon(const char *msg) {
@@ -49,25 +58,45 @@ static void DYBeacon(const char *msg) {
     int n = 0;
     if (home) {
         snprintf(p1, sizeof(p1), "%s/Documents/dyprobe_params.txt", home);
-        snprintf(p2, sizeof(p2), "%s/Documents/dyprobe_v20.txt", home);
-        paths[n++] = p1;
-        paths[n++] = p2;
+        snprintf(p2, sizeof(p2), "%s/Documents/dyprobe_v21.txt", home);
+        paths[n++] = p1; paths[n++] = p2;
     }
     if (tmpd) {
-        snprintf(p3, sizeof(p3), "%s/dyprobe_v20.txt", tmpd);
+        snprintf(p3, sizeof(p3), "%s/dyprobe_v21.txt", tmpd);
         paths[n++] = p3;
     }
-
     for (int i = 0; i < n; i++) {
         FILE *f = fopen(paths[i], "a");
         if (!f) continue;
         fprintf(f, "%s %s | %s\n", DY_BEACON, msg, stamp);
-        fflush(f);
-        fclose(f);          /* 立刻关，进程被杀也不丢 */
+        fflush(f); fclose(f);
     }
 }
 
-/* ===================== 带格式的日志（追加到同一批文件） ===================== */
+/* ===================== 日志 ===================== */
+/* 调用者必须已持有 g_mtx */
+static void LRawLocked(NSString *s) {
+    if (!s) return;
+    NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d || !d.length) return;
+
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSMutableArray<NSString *> *targets = [NSMutableArray array];
+    if (docs) {
+        [targets addObject:[docs stringByAppendingPathComponent:@"dyprobe_params.txt"]];
+        [targets addObject:[docs stringByAppendingPathComponent:@"dyprobe_v21.txt"]];
+    }
+    NSString *td = NSTemporaryDirectory();
+    if (td) [targets addObject:[td stringByAppendingPathComponent:@"dyprobe_v21.txt"]];
+
+    for (NSString *p in targets) {
+        FILE *f = fopen(p.fileSystemRepresentation, "a");
+        if (!f) continue;
+        fwrite(d.bytes, 1, d.length, f);
+        fflush(f); fclose(f);
+    }
+}
+
 static void L(NSString *fmt, ...) {
     if (!fmt) return;
     va_list ap;
@@ -76,49 +105,71 @@ static void L(NSString *fmt, ...) {
     va_end(ap);
     if (!s) return;
 
-    NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-    if (!d || !d.length) return;
-
-    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSMutableArray<NSString *> *targets = [NSMutableArray array];
-    if (docs) {
-        [targets addObject:[docs stringByAppendingPathComponent:@"dyprobe_params.txt"]];
-        [targets addObject:[docs stringByAppendingPathComponent:@"dyprobe_v20.txt"]];
+    pthread_mutex_lock(&g_mtx);
+    BOOL allow = (g_writes < DY_MAXLINE);
+    if (allow) {
+        g_writes++;
+        @try { LRawLocked(s); } @catch (...) {}
     }
-    NSString *td = NSTemporaryDirectory();
-    if (td) [targets addObject:[td stringByAppendingPathComponent:@"dyprobe_v20.txt"]];
-
-    for (NSString *p in targets) {
-        FILE *f = fopen(p.fileSystemRepresentation, "a");
-        if (!f) continue;
-        fwrite(d.bytes, 1, d.length, f);
-        fflush(f);
-        fclose(f);
-    }
+    pthread_mutex_unlock(&g_mtx);
 }
 
+/* ===================== 值转字符串（支持自定义对象递归） ===================== */
+static NSString *DYStrD(id o, int depth);
+
 static NSString *DYStr(id o) {
-    if (!o) return @"(nil)";
-    NSString *s = nil;
-    @try {
-        if ([o isKindOfClass:[NSString class]]) {
-            s = (NSString *)o;
-        } else if ([o isKindOfClass:[NSNumber class]]) {
-            s = [o description];
-        } else if ([NSJSONSerialization isValidJSONObject:o]) {
-            NSData *d = [NSJSONSerialization dataWithJSONObject:o options:0 error:NULL];
-            if (d) s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-        }
-        if (!s) s = [o description];
-    } @catch (...) {
-        s = @"(dump 抛异常)";
-    }
-    if (!s) s = @"(nil)";
-    if (s.length > DY_MAXLEN) s = [[s substringToIndex:DY_MAXLEN] stringByAppendingString:@"…<已截断>"];
+    NSString *s = DYStrD(o, 0);
+    if (s.length > DY_MAXLEN) s = [[s substringToIndex:DY_MAXLEN] stringByAppendingString:@"…<截断>"];
     return s;
 }
 
+static NSString *DYStrD(id o, int depth) {
+    if (!o) return @"(nil)";
+    if (depth > 3) return @"<深度截断>";
+    @try {
+        if ([o isKindOfClass:[NSString class]]) return (NSString *)o;
+        if ([o isKindOfClass:[NSNumber class]]) return [o description];
+        if ([o isKindOfClass:[NSArray class]]) {
+            NSMutableArray *a = [NSMutableArray array];
+            for (id e in (NSArray *)o) [a addObject:DYStrD(e, depth + 1)];
+            return [NSString stringWithFormat:@"[%@]", [a componentsJoinedByString:@", "]];
+        }
+        if ([o isKindOfClass:[NSDictionary class]]) {
+            NSMutableArray *a = [NSMutableArray array];
+            NSArray *ks = [[(NSDictionary *)o allKeys] sortedArrayUsingSelector:@selector(compare:)];
+            for (id k in ks) {
+                [a addObject:[NSString stringWithFormat:@"%@=%@", DYStrD(k, depth + 1),
+                              DYStrD([(NSDictionary *)o objectForKey:k], depth + 1)]];
+            }
+            return [NSString stringWithFormat:@"{%@}", [a componentsJoinedByString:@", "]];
+        }
+    } @catch (...) { return @"(取值异常)"; }
+
+    NSString *cls = NSStringFromClass([o class]);
+    NSString *desc = nil;
+    @try { desc = [o description]; } @catch (...) {}
+    /* 自定义对象：把 description 里的换行压平成一行，便于阅读 */
+    if (desc) desc = [desc stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    return [NSString stringWithFormat:@"<%@>%@", cls, desc ? desc : @""];
+}
+
 /* ===================== 类结构导出 ===================== */
+static void DYDumpMethods(Class c, BOOL classSide, const char *tag) {
+    Class t = classSide ? object_getClass((id)c) : c;
+    if (!t) return;
+    unsigned int mn = 0;
+    Method *ms = class_copyMethodList(t, &mn);
+    NSMutableArray *ma = [NSMutableArray array];
+    for (unsigned int i = 0; i < mn && i < 200; i++) {
+        const char *sn = sel_getName(method_getName(ms[i]));
+        const char *te = method_getTypeEncoding(ms[i]);
+        if (sn) [ma addObject:[NSString stringWithFormat:@"%s [%s]", sn, te ? te : "?"]];
+    }
+    if (ms) free(ms);
+    if (mn == 0) return;                 /* 空的就不占篇幅 */
+    L(@"[%@方法 %u 个] %@", classSide ? @"类" : @"", mn, [ma componentsJoinedByString:@", "]);
+}
+
 static void DYDumpClass(Class c, const char *tag) {
     if (!c) { L(@"[%s] 类不存在", tag); return; }
     L(@"\n---- 类 %s ----", class_getName(c));
@@ -134,241 +185,246 @@ static void DYDumpClass(Class c, const char *tag) {
     if (ps) free(ps);
     L(@"[属性 %u 个] %@", pn, [pa componentsJoinedByString:@", "]);
 
-    unsigned int mn = 0;
-    Method *ms = class_copyMethodList(c, &mn);
-    NSMutableArray *ma = [NSMutableArray array];
-    for (unsigned int i = 0; i < mn && i < 200; i++) {
-        const char *sn = sel_getName(method_getName(ms[i]));
-        const char *te = method_getTypeEncoding(ms[i]);
-        if (sn) [ma addObject:[NSString stringWithFormat:@"%s [%s]", sn, te ? te : "?"]];
-    }
-    if (ms) free(ms);
-    L(@"[方法 %u 个] %@", mn, [ma componentsJoinedByString:@", "]);
+    DYDumpMethods(c, NO, tag);
+    DYDumpMethods(c, YES, tag);
     L(@"----------------");
+}
+
+/* 关键补充：KMP 类的字段在父类，必须沿父类链 dump */
+static void DYDumpChain(Class c, const char *tag) {
+    if (!c) { L(@"[%s] 类不存在", tag); return; }
+    Class cur = c;
+    int lvl = 0;
+    while (cur && cur != [NSObject class] && lvl < 4) {
+        L(@"[链 %d] %s -> %s", lvl, class_getName(c), class_getName(cur));
+        DYDumpClass(cur, tag);
+        cur = class_getSuperclass(cur);
+        lvl++;
+    }
+    if (cur) L(@"[链尾] %s", class_getName(cur));
 }
 
 /* ===================== 影子注入（只算不改） ===================== */
 static void DYShadow(id dict, NSString *tag) {
-    if (![dict isKindOfClass:[NSDictionary class]]) {
-        L(@"[SHADOW %@] 不是字典，实际类型 %@", tag, NSStringFromClass([dict class]));
+    if (!dict) return;
+    if ([dict isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)dict;
+        L(@"[KEYS %@] %@", tag,
+          [[[d allKeys] sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "]);
+        id te = [d objectForKey:@"text_extra"];
+        if (!te) te = [d objectForKey:@"textExtra"];
+        if (te) L(@"[TEXT_EXTRA %@] %@", tag, DYStr(te));
         return;
     }
-    NSDictionary *d = (NSDictionary *)dict;
-    NSArray *keys = [[d allKeys] sortedArrayUsingSelector:@selector(compare:)];
-    L(@"[KEYS %@] %@", tag, [keys componentsJoinedByString:@", "]);
-
-    id te = [d objectForKey:@"text_extra"];
-    if (!te) te = [d objectForKey:@"textExtra"];
-    if (!te) te = [d objectForKey:@"text_extras"];
-    if (!te) te = [d objectForKey:@"textExtras"];
-    L(@"[TEXT_EXTRA %@] %@", tag, DYStr(te));
-
-    id txt = [d objectForKey:@"text"];
-    if (!txt) txt = [d objectForKey:@"content"];
-    L(@"[TEXT %@] %@", tag, DYStr(txt));
-
-    NSMutableArray *out = [NSMutableArray array];
-    if ([te isKindOfClass:[NSArray class]]) {
-        for (id e in (NSArray *)te) {
-            if ([e isKindOfClass:[NSDictionary class]]) {
-                NSMutableDictionary *m = [(NSDictionary *)e mutableCopy];
-                m[@"type"] = @21;
-                [out addObject:m];
-            }
+    /* 自定义对象：只要有 textExtra / textExtras 就记下来 */
+    for (NSString *sel in @[@"textExtra", @"textExtras", @"text_extra"]) {
+        if ([dict respondsToSelector:NSSelectorFromString(sel)]) {
+            id v = nil;
+            @try { v = [dict performSelector:NSSelectorFromString(sel)]; } @catch (...) {}
+            if (v) L(@"[TEXT_EXTRA %@] %@.%@ = %@", tag, NSStringFromClass([dict class]), sel, DYStr(v));
         }
     }
-    if (out.count == 0 && [txt isKindOfClass:[NSString class]] && [(NSString *)txt length] > 0) {
-        [out addObject:@{ @"start": @0,
-                          @"end":   @([(NSString *)txt length]),
-                          @"type":  @21,
-                          @"user_id": @"" }];
-    }
-    L(@"[SHADOW %@] 若注入 type=21 -> %@", tag, DYStr(out));
 }
 
-/* ===================== hook ===================== */
-static id dy_get(id self, SEL _cmd) {
-    id r = nil;
-    if (g_origGet) { @try { r = ((id (*)(id, SEL))g_origGet)(self, _cmd); } @catch (...) {} }
-    g_getN++;
-    if (g_getLog < DY_LOGN) {
-        g_getLog++;
-        @try {
-            L(@"[GET #%d] -[%@ %@] = %@", g_getN,
-              NSStringFromClass([self class]), NSStringFromSelector(_cmd), DYStr(r));
-            DYShadow(r, [NSString stringWithFormat:@"get#%d", g_getN]);
-        } @catch (...) {}
-    }
-    return r;
+/* ===================== hook（用 block 承载，支持多类多方法） ===================== */
+static NSMutableDictionary<NSString *, NSNumber *> *g_cnt = nil;
+static int DYBump(NSString *key) {
+    pthread_mutex_lock(&g_mtx);
+    if (!g_cnt) g_cnt = [NSMutableDictionary dictionary];
+    int v = [g_cnt[key] intValue] + 1;
+    g_cnt[key] = @(v);
+    pthread_mutex_unlock(&g_mtx);
+    return v;
 }
 
-static void dy_set(id self, SEL _cmd, id v) {
-    g_setN++;
-    if (g_setLog < DY_LOGN) {
-        g_setLog++;
-        @try {
-            L(@"[SET #%d] -[%@ %@] <=\n%@", g_setN,
-              NSStringFromClass([self class]), NSStringFromSelector(_cmd), DYStr(v));
-            DYShadow(v, [NSString stringWithFormat:@"set#%d", g_setN]);
-        } @catch (...) {}
-    }
-    if (g_origSet) { @try { ((void (*)(id, SEL, id))g_origSet)(self, _cmd, v); } @catch (...) {} }
-}
-
-static BOOL DYHookSel(Class c, const char *selName, BOOL isSetter) {
-    SEL s = sel_registerName(selName);
-    Method m = class_getInstanceMethod(c, s);
+static BOOL DYIsObjectGetter(Method m) {
     if (!m) return NO;
+    if (method_getNumberOfArguments(m) != 2) return NO;
+    char rt[32] = {0};
+    method_getReturnType(m, rt, sizeof(rt));
+    return rt[0] == '@';
+}
 
-    const char *enc = method_getTypeEncoding(m);
-    if (!enc) return NO;
+static BOOL DYIsObjectSetter(Method m) {
+    if (!m) return NO;
+    if (method_getNumberOfArguments(m) != 3) return NO;
+    char rt[32] = {0};
+    method_getReturnType(m, rt, sizeof(rt));
+    if (rt[0] != 'v') return NO;
+    char a2[32] = {0};
+    method_getArgumentType(m, 2, a2, sizeof(a2));
+    return a2[0] == '@';
+}
 
-    int at = 0;
-    for (const char *q = enc; *q; q++) if (*q == '@') at++;
-
-    if (isSetter) {
-        if (enc[0] != 'v' || at < 2) {
-            L(@"[SKIP] setter %s 签名 %s 不是对象入参，跳过", selName, enc);
-            return NO;
-        }
-        g_origSet = method_setImplementation(m, (IMP)dy_set);
-        L(@"[HOOK] setter %s 已挂 (enc=%s)", selName, enc);
-        return g_origSet != NULL;
-    }
-
-    if (!(strlen(enc) >= 3 && enc[0] == '@' && enc[1] == '@' && enc[2] == ':')) {
-        L(@"[SKIP] getter %s 签名 %s 不是 @@:，跳过", selName, enc);
+/* 通用挂载：getter 记录返回值，setter 记录入参，同时做影子注入 */
+static BOOL DYHook(Class c, SEL s, BOOL isSetter, const char *tag) {
+    Method m = class_getInstanceMethod(c, s);
+    if (!m) { L(@"[MISS] %s -%s 不存在", tag, sel_getName(s)); return NO; }
+    if (isSetter ? !DYIsObjectSetter(m) : !DYIsObjectGetter(m)) {
+        L(@"[SKIP] %s %s 签名 %s 不合要求", tag, sel_getName(s), method_getTypeEncoding(m));
         return NO;
     }
-    g_origGet = method_setImplementation(m, (IMP)dy_get);
-    L(@"[HOOK] getter %s 已挂 (enc=%s)", selName, enc);
-    return g_origGet != NULL;
-}
 
-/* 按选择器反查，不靠类名猜 */
-static Class DYFindBySelector(const char *selName) {
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return Nil;
-    Class *all = (Class *)calloc((size_t)n, sizeof(Class));
-    if (!all) return Nil;
-    n = objc_getClassList(all, n);
+    IMP orig = method_getImplementation(m);
+    NSString *selName = NSStringFromSelector(s);
+    NSString *tagS = [NSString stringWithUTF8String:tag];
 
-    SEL want = sel_registerName(selName);
-    NSMutableArray *hits = [NSMutableArray array];
-    Class best = Nil;
-
-    for (int i = 0; i < n; i++) {
-        Class c = all[i];
-        const char *cn = class_getName(c);
-        if (!cn) continue;
-        if (!(strstr(cn, "Comment") || strstr(cn, "Publish") || strstr(cn, "Param"))) continue;
-
-        unsigned int mn = 0;
-        Method *ms = class_copyMethodList(c, &mn);
-        BOOL has = NO;
-        for (unsigned int j = 0; j < mn; j++) {
-            if (sel_isEqual(method_getName(ms[j]), want)) { has = YES; break; }
+    if (isSetter) {
+        id blk = ^(id self, id arg) {
+            @try {
+                int n = DYBump([tagS stringByAppendingFormat:@"|%@|S", selName]);
+                if (n <= DY_LOGN) {
+                    L(@"[S %@ %@ #%d] %@", tagS, selName, n, DYStr(arg));
+                    DYShadow(arg, [NSString stringWithFormat:@"S-%@#%d", selName, n]);
+                }
+            } @catch (...) {}
+            ((void (*)(id, SEL, id))orig)(self, s, arg);
+        };
+        IMP ni = imp_implementationWithBlock(blk);
+        if (!class_addMethod(c, s, ni, method_getTypeEncoding(m))) {
+            method_setImplementation(class_getInstanceMethod(c, s), ni);
         }
-        if (ms) free(ms);
-        if (has) {
-            [hits addObject:[NSString stringWithUTF8String:cn]];
-            if (!best) best = c;
-        }
-    }
-    free(all);
-    L(@"[SWEEP] 定义了 -%s 的类共 %lu 个：%@", selName,
-      (unsigned long)hits.count, [hits componentsJoinedByString:@", "]);
-    return best;
-}
-
-/* 列出运行时所有含 Comment/Publish 的类名，作为情报兜底 */
-static void DYListCandidates(void) {
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return;
-    Class *all = (Class *)calloc((size_t)n, sizeof(Class));
-    if (!all) return;
-    n = objc_getClassList(all, n);
-    NSMutableArray *hit = [NSMutableArray array];
-    for (int i = 0; i < n; i++) {
-        const char *nm = class_getName(all[i]);
-        if (!nm) continue;
-        if (strstr(nm, "CommentPublish") || strstr(nm, "PublishParameter") ||
-            strstr(nm, "PublishParams") || strstr(nm, "TextExtra")) {
-            [hit addObject:[NSString stringWithUTF8String:nm]];
+    } else {
+        id blk = ^id(id self) {
+            id r = nil;
+            @try { r = ((id (*)(id, SEL))orig)(self, s); } @catch (...) {}
+            @try {
+                int n = DYBump([tagS stringByAppendingFormat:@"|%@|G", selName]);
+                if (n <= DY_LOGN) {
+                    L(@"[G %@ %@ #%d] %@", tagS, selName, n, DYStr(r));
+                    DYShadow(r, [NSString stringWithFormat:@"G-%@#%d", selName, n]);
+                }
+            } @catch (...) {}
+            return r;
+        };
+        IMP ni = imp_implementationWithBlock(blk);
+        if (!class_addMethod(c, s, ni, method_getTypeEncoding(m))) {
+            method_setImplementation(class_getInstanceMethod(c, s), ni);
         }
     }
-    free(all);
-    L(@"[类总数 %d] [CANDIDATES] %@", n, [hit componentsJoinedByString:@", "]);
+    L(@"[HOOK] %s -%s (%@)", tag, sel_getName(s), isSetter ? @"setter" : @"getter");
+    return YES;
 }
 
+static BOOL DYHookNamed(Class c, const char *selName, BOOL isSetter, const char *tag) {
+    if (!c || !selName) return NO;
+    return DYHook(c, sel_registerName(selName), isSetter, tag);
+}
+
+/* 挂一个类的所有「纯对象参数」实例方法，用来抓发布链路的组包过程 */
+static void DYHookAllSimple(Class c, const char *tag) {
+    if (!c) return;
+    unsigned int mn = 0;
+    Method *ms = class_copyMethodList(c, &mn);
+    int hooked = 0;
+    for (unsigned int i = 0; i < mn && hooked < 14; i++) {
+        const char *sn = sel_getName(method_getName(ms[i]));
+        if (!sn) continue;
+        /* 跳过明显的危险/噪音方法 */
+        if (strncmp(sn, "init", 4) == 0 || strncmp(sn, "dealloc", 7) == 0 ||
+            strncmp(sn, ".cxx", 4) == 0 || strncmp(sn, "set", 3) == 0 ||
+            strcmp(sn, "description") == 0 || strcmp(sn, "class") == 0) continue;
+
+        Method m = ms[i];
+        unsigned int ac = method_getNumberOfArguments(m);
+        if (ac < 2 || ac > 4) continue;
+
+        char rt[32] = {0};
+        method_getReturnType(m, rt, sizeof(rt));
+        if (rt[0] != '@' && rt[0] != 'v') continue;
+
+        BOOL okArgs = YES;
+        for (unsigned int k = 2; k < ac; k++) {
+            char at[32] = {0};
+            method_getArgumentType(m, k, at, sizeof(at));
+            if (at[0] != '@') { okArgs = NO; break; }
+        }
+        if (!okArgs) continue;
+
+        if (ac == 2 && rt[0] == '@') { if (DYHook(c, method_getName(m), NO, tag)) hooked++; }
+        else if (ac == 3)            { if (DYHook(c, method_getName(m), YES, tag)) hooked++; }
+    }
+    if (ms) free(ms);
+    L(@"[HOOKALL] %s 挂了 %d 个方法", tag, hooked);
+}
+
+/* ===================== KMP 枚举取值 ===================== */
+static void DYDumpEnumValues(Class c, const char *tag) {
+    if (!c) { L(@"[%s] 类不存在", tag); return; }
+    for (NSString *selName in @[@"values", @"entries", @"companion"]) {
+        SEL s = NSSelectorFromString(selName);
+        if (![c respondsToSelector:s]) continue;
+        id v = nil;
+        @try { v = [c performSelector:s]; } @catch (...) {}
+        L(@"[枚举 %s] %@ = %@", tag, selName, DYStr(v));
+    }
+}
+
+/* ===================== 安装 ===================== */
 static void DYInstall(void) {
-    @try {
-        Class k = objc_getClass("AWEKMPBaseCommentPublishParameters");
-        if (k) DYDumpClass(k, "KMPBaseCommentPublishParameters");
-        else L(@"[MISS] AWEKMPBaseCommentPublishParameters 不存在");
-        Class kb = objc_getClass("AWEKMPBaseCommentPublishParametersBuilder");
-        if (kb) DYDumpClass(kb, "KMPBaseCommentPublishParametersBuilder");
-        else L(@"[MISS] ...Builder 不存在");
-    } @catch (...) { L(@"[ERR] KMP 类 dump 异常"); }
-
-    DYListCandidates();
-
-    static const char *cands[] = {
-        "AWECommentPublishParameterModel",
-        "AWECommentPublishParams",
-        "AWECommentPublishParameter",
-        "AWECommentPublishParamModel",
-    };
     Class c = Nil;
-    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
-        c = objc_getClass(cands[i]);
-        if (c) { L(@"[FOUND] 命中类名 %s", cands[i]); break; }
-    }
-    if (!c) {
-        c = DYFindBySelector("extraParams");
-        if (!c) {
-            L(@"[MISS] 运行时没有任何类定义 -extraParams");
-            return;
-        }
-        L(@"[FOUND] 按选择器扫描命中 %s", class_getName(c));
+
+    /* ---- 1) KMP 参数层：沿父类链 dump，字段基本都在父类 ---- */
+    c = objc_getClass("AWEKMPBaseCommentPublishParameters");
+    DYDumpChain(c, "KMPParams");
+    DYDumpChain(objc_getClass("AWEKMPBaseCommentPublishParametersBuilder"), "KMPParamsBuilder");
+    DYDumpChain(objc_getClass("AWEKMPBaseCommentPublishParametersCompanion"), "KMPParamsCompanion");
+
+    /* ---- 2) 正文 + text_extra 的真正载体 ---- */
+    DYDumpChain(objc_getClass("AWECommentInputContentModel"), "InputContentModel");
+
+    /* ---- 3) type 的枚举值（type=21 就在这里） ---- */
+    DYDumpClass(objc_getClass("AWEKMPCommentContentTextExtraType"), "TextExtraType");
+    DYDumpEnumValues(objc_getClass("AWEKMPCommentContentTextExtraType"), "TextExtraType");
+    DYDumpClass(objc_getClass("AWEKMPCommentContentTextExtraSubType"), "TextExtraSubType");
+    DYDumpClass(objc_getClass("AWEKMPCommentPublishScene"), "PublishScene");
+
+    /* ---- 4) 序列化层 + 结构体 ---- */
+    DYDumpClass(objc_getClass("AWEKMPTextExtraStructKMPListSerializer"), "TESerializer");
+    DYDumpChain(objc_getClass("TextExtraStructV2"), "TextExtraStructV2");
+    DYDumpChain(objc_getClass("AWECommentPanelListSwiftImpl.CommentContentTextExtra"), "ContentTextExtra");
+
+    /* ---- 5) 请求层 ---- */
+    DYDumpChain(objc_getClass("AWECommentPublishRequest"), "PublishRequest");
+    DYDumpChain(objc_getClass("AWECommentPublishParameterModel"), "ParameterModel");
+
+    /* ---- 6) 挂发布参数模型 ---- */
+    Class pm = objc_getClass("AWECommentPublishParameterModel");
+    if (pm) {
+        DYHookNamed(pm, "extraParams", NO, "PM");
+        DYHookNamed(pm, "setExtraParams:", YES, "PM");
+        DYHookNamed(pm, "contentModel", NO, "PM");
+        DYHookNamed(pm, "setContentModel:", YES, "PM");
     }
 
-    DYDumpClass(c, "PublishParameterModel");
-
-    BOOL ok = NO;
-    if (DYHookSel(c, "extraParams", NO)) ok = YES;
-    if (DYHookSel(c, "setExtraParams:", YES)) ok = YES;
-
-    if (!ok) {
-        unsigned int pn = 0;
-        objc_property_t *ps = class_copyPropertyList(c, &pn);
-        for (unsigned int i = 0; i < pn; i++) {
-            const char *nm = property_getName(ps[i]);
-            if (!nm) continue;
-            if (strstr(nm, "extra") || strstr(nm, "Extra")) {
-                if (DYHookSel(c, nm, NO)) ok = YES;
-                char setter[256];
-                snprintf(setter, sizeof(setter), "set%c%s:", toupper((unsigned char)nm[0]), nm + 1);
-                DYHookSel(c, setter, YES);
-            }
-        }
-        if (ps) free(ps);
+    /* ---- 7) 挂正文模型上的 textExtra 等字段 ---- */
+    Class icm = objc_getClass("AWECommentInputContentModel");
+    if (icm) {
+        DYHookNamed(icm, "textExtra", NO, "ICM");
+        DYHookNamed(icm, "setTextExtra:", YES, "ICM");
+        DYHookNamed(icm, "textExtras", NO, "ICM");
+        DYHookNamed(icm, "setTextExtras:", YES, "ICM");
+        DYHookNamed(icm, "text", NO, "ICM");
+        DYHookNamed(icm, "setText:", YES, "ICM");
     }
-    L(@"[%@] 结果：%@", ok ? @"OK" : @"FAIL", ok ? @"已挂上发布参数钩子" : @"没找到可挂的方法");
+
+    /* ---- 8) 挂组包/回调层，抓真实流转对象 ---- */
+    DYHookAllSimple(objc_getClass("AWECommentSwiftImpl.CommentPublishRequestProvider"), "Provider");
+    DYHookAllSimple(objc_getClass("AWECommentSwiftService.CommentPublishNetWorkLifeCycleObserver"), "LifeCycle");
+
+    L(@"[%@] 参数层探针安装完成", @"DONE");
 }
 
 /* ===================== 入口 ===================== */
 __attribute__((constructor)) static void DYInit(void) {
-    /* 第一行，纯 C，任何时候都留痕 */
     DYBeacon("dylib 已加载 · constructor 立即写入");
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            L(@"\n========== [v20] 安装开始 %@ ==========", [NSDate date]);
-            @try { DYInstall(); } @catch (...) { L(@"[v20] 安装异常，已忽略"); }
-            L(@"[v20] 就绪：进视频评论区发一条 tt21");
-            L(@"[v20] 文件：Documents/dyprobe_params.txt 或 dyprobe_v20.txt（内容相同）");
+            L(@"\n========== [v21] 安装开始 %@ ==========", [NSDate date]);
+            @try { DYInstall(); } @catch (...) { L(@"[v21] 安装异常，已忽略"); }
+            L(@"[v21] 就绪：进视频评论区发一条 tt21，然后杀进程导出 dyprobe_v21.txt");
         }
     });
 
@@ -376,7 +432,11 @@ __attribute__((constructor)) static void DYInit(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 10.0 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             @autoreleasepool {
-                L(@"[心跳 %ds] getter %d / setter %d", i * 10, g_getN, g_setN);
+                pthread_mutex_lock(&g_mtx);
+                int wr = g_writes;
+                NSUInteger cnt = g_cnt.count;
+                pthread_mutex_unlock(&g_mtx);
+                L(@"[心跳 %ds] 已写 %d 行 / 计数项 %lu 个", i * 10, wr, (unsigned long)cnt);
             }
         });
     }
