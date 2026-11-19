@@ -4,7 +4,16 @@
 #import <string.h>
 
 /*
- * DYProbe v8 - 抓到发布参数字典 extraParams，抓全 + 定点注入 type=21
+ * DYProbe v9 - v8 基础上新增「extraInfo 里 AWETextExtra.type 0->21」写入
+ *
+ * v8 实测定性（21:12）：extraParams 字典注入了 type=21、回读也带上了，但网页端不红。
+ *   根因判定：extraParams 是统计/上下文参数包(author_secuid/common_flags/unique_key)，
+ *   服务端生成请求 text_extra 用的是 contentModel.extraInfo 里的 AWETextExtra 对象。
+ *   发布时那个 @ 用户对象 type=0（日志 setExtraInfo: ... type = 0）—— 服务端照它生成普通@。
+ *
+ * v9 打法：hook setExtraInfo:(v@:@) 与 extraInfo(@@:)，把数组里每个 AWETextExtra 的 type
+ *   用「setType: 原始 IMP」写成 21（绕过本插件的只读 setType hook），只作用于这条正在发布的评论。
+ *   v8 的 extraParams 注入保留作双保险。列表展示的 type=21 对象不在 extraInfo 链上，不受影响。
  *
  * v7 决定性发现：
  *   - [SET-TYPE #2] 原值=0 紧跟 setContent: -> 列表选人@时 App 生成 textExtra type=0（发布链路）
@@ -40,6 +49,7 @@ static NSInteger gSetTypeCalls = 0;
 static NSInteger gStackCount = 0;
 static NSInteger gParamDumpCount = 0;
 static NSInteger gLastContentLen = 0;
+static NSInteger gModelTypeHit = 0;   /* v9: setType 写入 21 的次数 */
 
 static void DYAppend(NSString *line) {
     if (!gBuf) gBuf = [NSMutableString string];
@@ -269,6 +279,63 @@ static void dy_setExtraParams(id self, SEL _cmd, id arg) {
     if (orig) { @try { ((void(*)(id,SEL,id))orig)(self, _cmd, mutated); } @catch (...) {} }
 }
 
+/* ---------- v9: 把 extraInfo 数组里 AWETextExtra 的 type 0->21（写入，绕过只读 hook） ---------- */
+static void DYMutateExtraInfo(id arr, NSString *tag) {
+    @try {
+        if (!arr) return;
+        if (![arr isKindOfClass:[NSArray class]]) return;
+        NSUInteger n = [(NSArray *)arr count];
+        if (n == 0) return;
+        for (NSUInteger i = 0; i < n; i++) {
+            id e = [(NSArray *)arr objectAtIndex:i];
+            @try {
+                NSString *cn = NSStringFromClass([e class]);
+                id tv = nil;
+                @try { tv = [e valueForKey:@"type"]; } @catch (...) {}
+                DYAppend([NSString stringWithFormat:@"[EXTRAINFO] %@ [%lu] %@ type=%@", tag, (unsigned long)i, cn, DYSafe(tv)]);
+                if (![cn isEqualToString:@"AWETextExtra"]) continue;
+                /* 用 setType: 的原始 IMP 写入 21，绕开本插件的只读 dy_setType_int */
+                IMP realSetType = gOrigSetType;
+                if (realSetType && realSetType != (IMP)dy_setType_int && realSetType != (IMP)dy_setType_obj) {
+                    @try {
+                        ((void(*)(id,SEL,long long))realSetType)(e, @selector(setType:), 21LL);
+                        gModelTypeHit++;
+                        DYAppend([NSString stringWithFormat:@"[EXTRAINFO-TYPE] %@ [%lu] type 0->21 已写入(第%ld个)", tag, (unsigned long)i, (long)gModelTypeHit]);
+                        DYFlushLog();
+                    } @catch (NSException *ex) {
+                        DYAppend([NSString stringWithFormat:@"[EXTRAINFO-TYPE] setType 原始IMP写入异常 %@", ex.name]);
+                        DYFlushLog();
+                    }
+                } else {
+                    /* 兜底：KVC 写 NSNumber，交给 typeless setter */
+                    @try {
+                        [e setValue:@21 forKey:@"type"];
+                        gModelTypeHit++;
+                        DYAppend([NSString stringWithFormat:@"[EXTRAINFO-TYPE] %@ [%lu] type 0->21 已写入(KVC,第%ld个)", tag, (unsigned long)i, (long)gModelTypeHit]);
+                        DYFlushLog();
+                    } @catch (...) {}
+                }
+            } @catch (...) {}
+        }
+    } @catch (...) {}
+}
+
+/* setExtraInfo: setter：先改写数组里的 type，再交给原实现 */
+static void dy_setExtraInfo(id self, SEL _cmd, id arg) {
+    DYMutateExtraInfo(arg, @"setExtraInfo:");
+    IMP orig = DYOrigFor(self, _cmd);
+    if (orig) { @try { ((void(*)(id,SEL,id))orig)(self, _cmd, arg); } @catch (...) {} }
+}
+
+/* extraInfo getter：也守一道（有些链路直接读 getter 拿数组） */
+static id dy_extraInfo_get(id self, SEL _cmd) {
+    IMP orig = DYOrigFor(self, _cmd);
+    id r = nil;
+    if (orig) { @try { r = ((id(*)(id,SEL))orig)(self, _cmd); } @catch (...) {} }
+    DYMutateExtraInfo(r, @"extraInfo(get)");
+    return r;
+}
+
 /* ---------- 通用只读 dump trampoline ---------- */
 static void dy_dump_void0(id self, SEL _cmd) {
     IMP orig = DYOrigFor(self, _cmd);
@@ -374,10 +441,16 @@ static void DYHookClassMethods(Class cls, const char *clsName, NSString *exclude
             IMP orig = NULL;
             BOOL specialExtra = [sn isEqualToString:@"extraParams"] && [sig isEqualToString:@"@@:"];
             BOOL specialSetExtra = [sn isEqualToString:@"setExtraParams:"] && [sig isEqualToString:@"v@:@"];
+            BOOL specialSetEI   = [sn isEqualToString:@"setExtraInfo:"] && [sig isEqualToString:@"v@:@"];
+            BOOL specialEIGet   = [sn isEqualToString:@"extraInfo"] && [sig isEqualToString:@"@@:"];
             if (specialExtra) {
                 orig = method_setImplementation(ml[j], (IMP)dy_extraParams_get);
             } else if (specialSetExtra) {
                 orig = method_setImplementation(ml[j], (IMP)dy_setExtraParams);
+            } else if (specialSetEI) {
+                orig = method_setImplementation(ml[j], (IMP)dy_setExtraInfo);
+            } else if (specialEIGet) {
+                orig = method_setImplementation(ml[j], (IMP)dy_extraInfo_get);
             } else if ([sig isEqualToString:@"v@:"]) {
                 orig = method_setImplementation(ml[j], (IMP)dy_dump_void0);
             } else if ([sig isEqualToString:@"v@:@"]) {
@@ -393,7 +466,8 @@ static void DYHookClassMethods(Class cls, const char *clsName, NSString *exclude
                 [gHookedKeys addObject:key];
                 hooked++;
                 DYAppend([NSString stringWithFormat:@"[HOOK-MODEL] %s|%@ enc=%s%s", clsName, sn, enc ? enc : "?",
-                          specialExtra || specialSetExtra ? "  <<INJECT>>" : ""]);
+                          specialExtra || specialSetExtra ? "  <<INJECT>>" :
+                          (specialSetEI || specialEIGet) ? "  <<TYPE21>>" : ""]);
             }
         }
     } @catch (NSException *e) {
@@ -449,8 +523,8 @@ static void DYBootAlert(void) {
         UIViewController *vc = DYTopVC();
         if (!vc) return;
         @try {
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v8 注入测试"
-                message:@"抓发布参数 extraParams 并注入 type=21。\n用抖音 @ 功能选一个人发评论，去网页端看是否变红。\n日志自动复制到剪贴板，粘贴发回。"
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v9 注入测试"
+                message:@"v8 只改 extraParams 不生效，v9 改 extraInfo 里 AWETextExtra.type=21。\n用抖音 @ 功能选一个人发评论，去网页端看是否变红。\n日志以 Documents/dyprobe_dump.txt 为准（剪贴板会被抖音覆盖）。"
                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ DYCopyToPasteboard(); }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleCancel handler:nil]];
@@ -466,8 +540,8 @@ __attribute__((constructor)) static void DYInit(void) {
         gOrigBySel = [NSMutableDictionary dictionary];
         gHookedKeys = [NSMutableSet set];
         gSeenHits = [NSMutableSet set];
-        DYAppend(@"DYProbe v8 init (抓发布参数 extraParams + 注入 type=21)");
-        DYSave();
+        DYAppend(@"DYProbe v9 init (extraParams 注入 + extraInfo.type 0->21 写入)");
+        DYFlushLog();
     }
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
         object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
