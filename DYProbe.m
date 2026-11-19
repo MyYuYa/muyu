@@ -6,6 +6,8 @@
 #import <mach/mach.h>
 #import <mach/vm_map.h>
 #import <mach/vm_prot.h>
+#import <mach/vm_param.h>
+#import <unistd.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
@@ -22,9 +24,21 @@
  *
  * 与 v13/v14 的区别（针对两次启动闪退的教训）：
  *   - v13 崩：全类扫描 hook 几百个方法，ABI 靠猜
- *   - v14 崩：在 constructor 里立刻改 GOT，此时 dyld 的 chained fixups 尚未全部应用
- *   - v15：延迟 4 秒（启动完成、fixups 全部落地）后才动手；只改 1 个符号；
+ *   - v14 崩：constructor 里立刻动手，且遍历了所有 image（含 dyld 共享缓存里的系统库）。
+ *             对缓存镜像，linkedit->vmaddr - linkedit->fileoff + slide 算出的基址不成立，
+ *             读到的 symtab/strtab 是垃圾 → indirect 索引越界 → 崩。这是最可能的真实崩因。
+ *   - v15：延迟 4 秒（App 启动完成后再动手）；只改 1 个符号；跳过系统库；
  *          只读 buffer，绝不改内容、绝不改返回值、绝不 hook 业务对象
+ *
+ * 实测结构（AwemeCore，Python 直接解析 Mach-O 得到，非推测）：
+ *   - 无 LC_DYLD_CHAINED_FIXUPS（走老的 LC_DYLD_INFO_ONLY）
+ *   - 无 __DATA_CONST 段；段只有 __TEXT / __DATA / Data / __LYNX__DATA / __LINKEDIT
+ *   - 目标符号全在 __DATA,__la_symbol_ptr（lazy，RW 可写段）：
+ *       _SSL_write                 0x31e0e610
+ *       _SSL_read                  0x31e0e4a0
+ *       _X509_verify_cert          0x31e0ea20
+ *       _SSL_CTX_set_custom_verify 0x31e0e160
+ *   - 因此：写 GOT 不需要 vm_protect 提权，直接改指针即可。本版不再做任何 mprotect。
  *
  * 只做三件事：
  *   1) dlsym 先拿到 boringssl 里 SSL_write 的真实地址（orig）
@@ -79,9 +93,10 @@ static const void *dy_memmem(const void *h, size_t hl, const void *n, size_t nl)
     return NULL;
 }
 
-/* 把 buffer 转成可读文本：可打印字符保留，换行保留，其余转 '.' */
-static void DYDumpBuf(const char *tag, const void *buf, int len) {
-    if (!buf || len <= 0) return;
+/* 把 buffer 转成可读文本：可打印字符保留，换行保留，其余转 '.'
+ * 参数全用 C 类型，tag 在函数内部生成 NSString —— 避免 Objective-C 与 C 类型混用。 */
+static void DYDumpBuf(const char *kind, int index, const void *buf, int len) {
+    if (!kind || !buf || len <= 0) return;
     int n = len > 4096 ? 4096 : len;   /* 单次最多抄 4KB，防止文件爆掉 */
     const unsigned char *p = (const unsigned char *)buf;
     NSMutableString *ms = [NSMutableString stringWithCapacity:(NSUInteger)n + 128];
@@ -93,10 +108,11 @@ static void DYDumpBuf(const char *tag, const void *buf, int len) {
         else if (c >= 32 && c < 127) [ms appendFormat:@"%c", c];
         else                [ms appendString:@"."];
     }
-    NSString *head = [NSString stringWithFormat:
-                      @"\n===== %@ len=%d%s =====\n", tag, len, (len > n ? " (截断到4096)" : "")];
-    DYWrite([head stringByAppendingString:
-             [NSString stringWithFormat:@"%@\n===== END %@ =====", ms, tag]]);
+    NSString *tag    = [NSString stringWithFormat:@"%s#%d", kind, index];
+    NSString *suffix = (len > n) ? @" (截断到4096)" : @"";
+    NSString *head   = [NSString stringWithFormat:@"\n===== %@ len=%d%@ =====\n", tag, len, suffix];
+    NSString *body   = [NSString stringWithFormat:@"%@\n===== END %@ =====", ms, tag];
+    DYWrite([head stringByAppendingString:body]);
 }
 
 /* ============================ 核心：SSL_write ============================ */
@@ -123,7 +139,7 @@ static int dy_SSL_write(void *ssl, const void *buf, int num) {
             @try {
                 if (dy_isCommentPublish(buf, num)) {
                     g_dumpCount++;
-                    DYDumpBuf([NSString stringWithFormat:@"SSL_write#%d", g_dumpCount], buf, num);
+                    DYDumpBuf("SSL_write", g_dumpCount, buf, num);
                 }
             } @catch (...) {}
         }
@@ -170,13 +186,8 @@ static void dy_rebind_section(dy_section_t *sect, intptr_t slide,
     }
     if (!hit) return;
 
-    /* __DATA_CONST 是只读段，必须按页对齐后临时加写权限 */
-    uintptr_t ps = (uintptr_t)vm_page_size;
-    uintptr_t s = (uintptr_t)bindings & ~(ps - 1);
-    uintptr_t e = ((uintptr_t)bindings + sect->size + ps - 1) & ~(ps - 1);
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)s, (vm_size_t)(e - s),
-                                  0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) return;   /* 加不上权限就整段放弃，绝不硬写 */
+    /* 实测：目标符号位于 __DATA,__la_symbol_ptr，该段本身可写，
+     * 直接改指针即可。v14 里那套 vm_protect 提权是多余的，本版全部去掉。 */
 
     for (size_t k = 0; k < cnt; k++) {
         uint32_t si = indices[k];
@@ -224,7 +235,9 @@ static void dy_rebind_image(const struct mach_header *header, intptr_t slide) {
         if (seg->cmdsize == 0) break;
         cur += seg->cmdsize;
         if (seg->cmd != LC_SEGMENT_64) continue;
-        if (strcmp(seg->segname, SEG_DATA) != 0 && strcmp(seg->segname, "__DATA_CONST") != 0) continue;
+        /* 只处理 __DATA（RW 可写段）。实测 AwemeCore 无 __DATA_CONST；
+         * 限定 __DATA 也顺带避免误碰其他 image 的只读段。 */
+        if (strcmp(seg->segname, SEG_DATA) != 0) continue;
         dy_section_t *sect = (dy_section_t *)((uintptr_t)seg + sizeof(dy_segment_command_t));
         for (uint32_t j = 0; j < seg->nsects; j++, sect++) {
             dy_rebind_section(sect, slide, symtab, strtab, indirect);
@@ -251,7 +264,11 @@ static void dy_install(void) {
         if (strncmp(nm, "/usr/lib/", 9) == 0) continue;
         if (strncmp(nm, "/System/Library/", 16) == 0) continue;
         if (strncmp(nm, "/System/Cryptexes/", 18) == 0) continue;
+        int before = g_replaced;
         dy_rebind_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+        if (g_replaced != before) {
+            DYWrite([NSString stringWithFormat:@"[v15] 命中 image: %s（改写 %d 处）", nm, g_replaced - before]);
+        }
         scanned++;
     }
     DYWrite([NSString stringWithFormat:@"[v15] 安装完成：扫描 %u/%u 个非系统 image，改写 GOT %d 处",
@@ -262,9 +279,9 @@ static void dy_install(void) {
 }
 
 __attribute__((constructor)) static void DYInit(void) {
-    /* 关键：不在 constructor 里立刻动手。
-     * v14 就是在这里立刻改 GOT 崩的——此时 dyld 的 chained fixups 还没全部应用完。
-     * 延后 4 秒，等 App 启动完成、所有 image 的 fixup 落地后再改，安全得多。 */
+    /* 不在 constructor 里立刻动手：那一刻所有 image 仍在加载与初始化，
+     * 遍历它们做符号解析容易读到未就绪的数据（v14 崩在这个阶段）。
+     * 延后 4 秒，等 App 启动稳定、各 image 的 `__DATA` 已就绪后再改。 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @autoreleasepool {
