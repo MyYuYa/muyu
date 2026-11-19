@@ -60,8 +60,22 @@ static BOOL gHookUnsupported = NO;
 
 static void DYAppend(NSString *line) {
     if (!gBuf) gBuf = [NSMutableString string];
-    if (gBuf.length > 300000) return;
-    [gBuf appendFormat:@"%@\n", line];
+    NSString *ln = [NSString stringWithFormat:@"%@\n", line];
+    if (gBuf.length <= 300000) [gBuf appendString:ln];
+    /* 【v12】每条即时增量落盘：崩溃时内存缓冲丢失，但磁盘保留最后一行，便于定位崩溃点 */
+    @try {
+        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (doc) {
+            NSString *path = [doc stringByAppendingPathComponent:@"dyprobe_dump.txt"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if (![fm fileExistsAtPath:path]) {
+                [ln writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            } else {
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+                if (fh) { [fh seekToEndOfFile]; [fh writeData:[ln dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+            }
+        }
+    } @catch (...) {}
     NSLog(@"[DYPROBE] %@", line);
 }
 
@@ -247,7 +261,9 @@ static id DYInjectBody(id obj, NSString *tag) {
             return md;
         }
         if ([obj isKindOfClass:[NSArray class]]) {
-            /* textExtras 数组参数：把每个元素的 type 改 21 */
+            /* textExtras 数组参数：只改字典元素的 type。
+             * 【v12 止血】绝不 KVC 自定义对象(Swift/KMP)——会触发不可捕获的 EXC_BAD_ACCESS 崩溃。
+             * 数组里的 AWETextExtra 等 model 元素一律跳过，只处理纯 NSDictionary。 */
             NSMutableArray *ma = [obj isKindOfClass:[NSMutableArray class]] ? obj : [obj mutableCopy];
             BOOL c2 = NO;
             for (NSUInteger i = 0; i < [ma count]; i++) {
@@ -257,46 +273,19 @@ static id DYInjectBody(id obj, NSString *tag) {
                     [me setObject:@21 forKey:@"type"];
                     [ma replaceObjectAtIndex:i withObject:me];
                     c2 = YES;
-                } else if ([e isKindOfClass:[NSObject class]]) {
-                    @try {
-                        NSString *cn = NSStringFromClass([e class]);
-                        if ([cn rangeOfString:@"TextExtra"].location != NSNotFound) {
-                            [e setValue:@21 forKey:@"type"];
-                            c2 = YES;
-                        }
-                    } @catch (...) {}
                 }
+                /* 非字典元素（自定义 model）跳过，不做任何 KVC */
             }
             if (c2) {
                 gBodyHitCount++;
-                DYAppend([NSString stringWithFormat:@"[INJECT-BODY #%ld] %@ textExtras 数组元素 type->21 (count=%lu)",
+                DYAppend([NSString stringWithFormat:@"[INJECT-BODY #%ld] %@ textExtras 字典元素 type->21 (count=%lu)",
                           (long)gBodyHitCount, tag, (unsigned long)[ma count]]);
                 DYFlushLog();
                 return ma;
             }
         }
-        /* 自定义 model 对象兜底：保守地尝试 KVC 注入其字典/数组属性 */
-        NSString *cn = NSStringFromClass([obj class]);
-        if (![cn hasPrefix:@"NS"] && ![cn isEqualToString:@"__NSCFString"]) {
-            NSArray *cand = @[@"params", @"textExtra", @"text_extra", @"commentParams",
-                              @"extraParams", @"requestParams", @"publishParams", @"textExtras"];
-            BOOL modelChanged = NO;
-            for (NSString *k in cand) {
-                id val = nil;
-                @try { val = [obj valueForKey:k]; } @catch (...) { continue; }
-                if (!val) continue;
-                id injected = DYInjectBody(val, [[tag stringByAppendingString:@".model"] stringByAppendingFormat:@".%@", k]);
-                if (injected != val) {
-                    @try { [obj setValue:injected forKey:k]; modelChanged = YES; } @catch (...) {}
-                }
-            }
-            if (modelChanged) {
-                gBodyHitCount++;
-                DYAppend([NSString stringWithFormat:@"[INJECT-BODY #%ld] %@ 自定义对象 %@ 的字典属性已注入 type=21",
-                          (long)gBodyHitCount, tag, cn]);
-                DYFlushLog();
-            }
-        }
+        /* 【v12 止血】自定义对象一律原样返回，绝不 valueForKey/setValue:forKey。
+         * 崩溃根因：对 Swift/KMP model 做 KVC 触发信号级崩溃，@try 抓不住。 */
         return obj;
     } @catch (NSException *e) {
         DYAppend([NSString stringWithFormat:@"[INJECT-BODY] %@ 异常 %@ 放弃", tag, e.name]);
@@ -438,6 +427,29 @@ static void dy_body_g6_v(id self, SEL _cmd, id a1,id a2,id a3,id a4,id a5,id a6)
     if(DYGate([NSString stringWithFormat:@"gn6v|%@",tag])){DYAppend([NSString stringWithFormat:@"[BODY-HIT-G6V] %@",tag]);DYFlushLog();}
 }
 
+/* 【v12 新增】addCommentParams 专用 trampoline
+ * 真实签名(41.0.0 日志实锤)：@56@0:8q16@24@32@40@48
+ * 即：返回对象；参数1=long long(q)，随后 4 个对象：generalModel/commentModel/textExtras/params
+ * ABI 关键：第 1 个业务参数是 64 位标量 q，必须按 long long 接收，不能当 id！ */
+static id dy_body_addCommentParams(id self, SEL _cmd, long long p1, id o2, id o3, id o4, id o5) {
+    NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
+    /* o4=textExtras 数组, o5=params 字典（按 selector 段序，最后一个 textExtras:/params:） */
+    id o4n = DYInjectBody(o4, [tag stringByAppendingString:@".textExtras"]);
+    id o5n = DYInjectBody(o5, [tag stringByAppendingString:@".params"]);
+    IMP orig = DYOrigFor(self, _cmd);
+    id r = nil;
+    if (orig) {
+        @try {
+            r = ((id(*)(id,SEL,long long,id,id,id,id))orig)(self, _cmd, p1, o2, o3, o4n, o5n);
+        } @catch (...) {}
+    }
+    id out = DYInjectBody(r, [tag stringByAppendingString:@".ret"]);
+    DYAppend([NSString stringWithFormat:@"[BODY-HIT-ADDPARAMS] %@ p1=%lld o4(textExtras)=%@ o5(params)=%@ ret=%@",
+              tag, p1, DYSafeFull(o4), DYSafeFull(o5), DYSafeFull(r)]);
+    DYFlushLog();
+    return out;
+}
+
 /* ---------- setType: 只读对照 ---------- */
 static int DYSetTypeArgKind(const char *enc) {
     if (!enc) return 0;
@@ -576,17 +588,17 @@ static void dy_setExtraParams(id self, SEL _cmd, id arg) {
     if (orig) { @try { ((void(*)(id,SEL,id))orig)(self, _cmd, mutated); } @catch (...) {} }
 }
 
+/* 【v12】model 层改为纯只读对照：
+ * 旧版在这里用原始 setType 或 KVC 改 AWETextExtra.type，v9 已证伪「只喂本地渲染、服务端不认」，
+ * 且 KVC(setValue:forKey:) 对 Swift/KMP 对象触发过不可捕获的崩溃。v12 一律不写，只 dump。 */
 static void DYMutateExtraInfo(id arr) {
     @try {
         if (!arr || ![arr isKindOfClass:[NSArray class]]) return;
         for (id e in (NSArray *)arr) {
             @try {
                 if ([NSStringFromClass([e class]) isEqualToString:@"AWETextExtra"]) {
-                    IMP realSetType = gOrigSetType;
-                    if (realSetType && realSetType != (IMP)dy_setType_int && realSetType != (IMP)dy_setType_obj) {
-                        @try { ((void(*)(id,SEL,long long))realSetType)(e, @selector(setType:), 21LL); } @catch (...) {}
-                    } else {
-                        @try { [e setValue:@21 forKey:@"type"]; } @catch (...) {}
+                    if (DYGate([@"extrainfo-ro|" stringByAppendingString:DYSafe(e)])) {
+                        DYAppend([NSString stringWithFormat:@"[EXTRAINFO-RO] %@ (只读,未改写)", DYSafe(e)]);
                     }
                 }
             } @catch (...) {}
@@ -628,20 +640,27 @@ static void DYInstallSetTypeHook(void) {
 typedef struct { const char *sel; int nargs; } DYBizSel;
 static const DYBizSel kBizSels[] = {
     { "publishCommentParamsForServer", 0 },
-    { "getPenetrateParamsForServer", 0 },
     { "commentParamsWithModel:refer:", 2 },
     { "publishCommentWithRequest:inputSnapshot:", 2 },
     { "commentPublishRequestWithSnapshot:refer:", 2 },
+    /* 【v12】保留 addCommentParams（专用 trampoline 处理）；移除 submitTextExtras(个性签名/分享)
+     * 与 getPenetrateParamsForServer(电商搜索)——它们与评论无关，却在无关场景触发注入噪声。 */
     { "addCommentParams:generalModel:commentModel:textExtras:params:", 5 },
-    { "submitTextExtras", 0 },
-    { "checkSubmitTextExtras", 0 },
-    { "trackSubmitTextExtras", 0 },
 };
 
 /* 根据 selector 名 + 签名选择 trampoline；NULL 表示不匹配（放弃，防崩）
  * ABI 安全：业务参数必须全是对象、返回值必须是 @(对象) 或 v(void)，否则不 hook。 */
 static IMP DYPickTrampoline(SEL sel, const char *enc) {
     if (!enc) return NULL;
+    /* 【v12】addCommentParams 专用：签名 @@:q@@@@ (返回对象 + long long + 4对象)。
+     * 必须在全对象校验前拦截，因为 q 会被 DYObjectArgCount 判 -1 跳过。 */
+    NSString *sn0 = NSStringFromSelector(sel);
+    if ([sn0 isEqualToString:@"addCommentParams:generalModel:commentModel:textExtras:params:"]) {
+        NSString *sig0 = DYSigOf(enc);
+        if ([sig0 isEqualToString:@"@@:q@@@@"]) return (IMP)dy_body_addCommentParams;
+        DYAppend([NSString stringWithFormat:@"[HOOK-BODY] ⚠addCommentParams 签名非预期 %@ (需@@:q@@@@) 放弃", sig0]);
+        return NULL;
+    }
     char ret = enc[0];
     BOOL retVoid = (ret == 'v');
     BOOL retObj  = (ret == '@');
@@ -817,8 +836,8 @@ static void DYBootAlert(void) {
         UIViewController *vc = DYTopVC();
         if (!vc) return;
         @try {
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v11 注入测试"
-                message:@"打法转到 body 组装层，type 改回 21。\n发一条普通评论（不必@），去网页端/别人手机看是否红。\n日志以 Documents/dyprobe_dump.txt 为准。"
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v12 注入测试"
+                message:@"v12 止血版：移除 KVC（修崩溃）+ 新增 addCommentParams body 注入 + 日志即时落盘。\ntype=21。发一条普通评论（不必@），去网页端/别人手机看是否红。\n日志以 Documents/dyprobe_dump.txt 为准。"
                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ DYCopyToPasteboard(); }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleCancel handler:nil]];
@@ -834,7 +853,7 @@ __attribute__((constructor)) static void DYInit(void) {
         gOrigBySel = [NSMutableDictionary dictionary];
         gHookedKeys = [NSMutableSet set];
         gSeenHits = [NSMutableSet set];
-        DYAppend(@"DYProbe v11 init (body层注入 type=21; 数组+JSON双写; end=UTF8字节)");
+        DYAppend(@"DYProbe v12 init (body层注入 type=21; 无KVC止血; addCommentParams专用; 日志即时落盘)");
         DYFlushLog();
     }
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
