@@ -7,56 +7,48 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
-#include <execinfo.h>
-#include <dlfcn.h>
 
 /*
- * DYProbe v24 —— 抓「最终发出去的请求体」
+ * DYProbe v25 —— 查服务端到底有没有收下 text_extra
  *
- * 已知事实（全部实测）：
- *   v23 注入 extraParams["text_extra"] 后，iOS 客户端显示红色，但网页端普通
- *   → text_extra 被客户端某个消费方读到了（所以本机能渲染红）
- *   → 但服务端没有存 → 请求体里要么没这个字段，要么格式/键名不对
+ * v24 已证实（铁证，不是推测）：
+ *   comment/publish 请求体 = extraParams 直通，实测发出去的是：
+ *   text=%23ai%20666&text_extra=[{"start":0,"end":7,"type":21}]
+ *   字段名 / JSON 字符串 / UTF-8 字节偏移 / type=21 全部与网页端一致
+ *   → 客户端这一侧没有任何问题，问题在服务端是否接受
  *
- * v22 实测：纯文本评论时 contentModel.extraInfo = []（空）
- *   → iOS 原生纯文本评论不生成 text_extra
- *   → 带 #话题 的评论一定会生成（话题是 type=1 的 span）
+ * 剩下两种可能，必须用「服务端响应」区分：
+ *   A. 服务端收了并回传了 text_extra → 任务其实已成，只是网页端不渲染 type=21
+ *   B. 服务端剥离了 text_extra → 需要补字段（自己的 user_id/sec_uid）或换路径
  *
- * 所以本版做两件事，一次运行出全部答案：
- *   1. 抓请求体：hook 所有「设置 body」的方法，只要内容像评论请求就整段打出来
- *      → 能看到 iOS 端 text_extra 的真实键名、真实格式（JSON 字符串还是数组）
- *   2. extraInfo 被写入非空时，把每个元素的类 / ivar / 取值全部打出来
- *      → 这是原生路径的模板，照着造就能绕过 KMP 覆盖
+ * 本版做三件事：
+ *   1. 抓响应体（类名含 Response 的 setBody/setData 等），命中 text_extra 就把
+ *      它前后文整段打出来 —— 一眼看出服务端存没存
+ *   2. 找自己的 uid / sec_uid（NSUserDefaults 里的登录信息），下一版给 span 补上
+ *   3. 关掉注入的开关改成实时读盘（放/删 Documents/dyprobe_off.txt 立即生效，
+ *      不用重装）—— 方便你发一条「原生话题评论」看原始 text_extra 长什么样
  *
- * 注入逻辑保留（v23 已证明能本地变红，留着做对照）。
- *
- * 【操作】发一条带话题的评论：  #测试 你好
- *         （这条会生成真实的 text_extra，请求体里必然带，好定位）
- *         再发一条纯文本 tt21（看注入效果）
- *         然后杀进程，导出 Documents/dyprobe_v24.txt
- *
- * 崩溃防护：
- *   - 只 hook 参数类型编码为 '@'（对象）的方法，避免把 C 指针当对象解引用
- *   - 所有转发包 @try
- *   - 日志硬上限 900 行
+ * 噪音比 v24 大幅降低：只留含 publish_scene / text_extra / comment / aweme_id
+ * 且长度不大的 body，同一 unique_key 只打一次。
  */
 
 #define DY_MAXLEN   6000
-#define DY_MAXLINE  900
-#define DY_BEACON   "[v24]"
-#define DY_MAXHOOK  260
+#define DY_MAXLINE  500
+#define DY_BEACON   "[v25]"
+#define DY_MAXHOOK  300
 
 static int g_writes = 0;
 static int g_injectN = 0;
 static int g_bodySeen = 0;
 static int g_bodyHit = 0;
-static int g_extraN = 0;
+static int g_respHit = 0;
 static int g_rawN = 0;
+static int g_extraN = 0;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 static IMP g_origExtraParams = NULL;
-
-/* 同线程最近一次设置的 URL，用来给 body 配对 */
-static __thread char g_tlsURL[768];
+static NSString *g_myUid = nil;
+static NSString *g_mySecUid = nil;
+static NSString *g_lastBody = nil;
 
 /* ===================== 信标 ===================== */
 static void DYBeacon(const char *msg) {
@@ -72,11 +64,11 @@ static void DYBeacon(const char *msg) {
     int n = 0;
     if (home) {
         snprintf(p1, sizeof(p1), "%s/Documents/dyprobe_params.txt", home);
-        snprintf(p2, sizeof(p2), "%s/Documents/dyprobe_v24.txt", home);
+        snprintf(p2, sizeof(p2), "%s/Documents/dyprobe_v25.txt", home);
         paths[n++] = p1; paths[n++] = p2;
     }
     if (tmpd) {
-        snprintf(p3, sizeof(p3), "%s/dyprobe_v24.txt", tmpd);
+        snprintf(p3, sizeof(p3), "%s/dyprobe_v25.txt", tmpd);
         paths[n++] = p3;
     }
     for (int i = 0; i < n; i++) {
@@ -96,10 +88,10 @@ static void LRawLocked(NSString *s) {
     NSMutableArray<NSString *> *targets = [NSMutableArray array];
     if (docs) {
         [targets addObject:[docs stringByAppendingPathComponent:@"dyprobe_params.txt"]];
-        [targets addObject:[docs stringByAppendingPathComponent:@"dyprobe_v24.txt"]];
+        [targets addObject:[docs stringByAppendingPathComponent:@"dyprobe_v25.txt"]];
     }
     NSString *td = NSTemporaryDirectory();
-    if (td) [targets addObject:[td stringByAppendingPathComponent:@"dyprobe_v24.txt"]];
+    if (td) [targets addObject:[td stringByAppendingPathComponent:@"dyprobe_v25.txt"]];
     for (NSString *p in targets) {
         FILE *f = fopen(p.fileSystemRepresentation, "a");
         if (!f) continue;
@@ -120,7 +112,6 @@ static void L(NSString *fmt, ...) {
     pthread_mutex_unlock(&g_mtx);
 }
 
-/* 不加锁、不计数，给 hook 内部用（避免与主日志交错死锁） */
 static void LFast(NSString *s) {
     if (!s) return;
     pthread_mutex_lock(&g_mtx);
@@ -145,18 +136,15 @@ static NSString *DYStr(id o) {
     return s;
 }
 
-/* ===================== 调试开关 ===================== */
+/* ===================== 调试开关（实时读盘，不缓存） ===================== */
 static NSString *DYDocPath(NSString *name) {
     NSString *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     return d ? [d stringByAppendingPathComponent:name] : nil;
 }
 
 static BOOL DYSwitchOff(void) {
-    static int cache = -1;
-    if (cache >= 0) return cache == 1;
     NSString *p = DYDocPath(@"dyprobe_off.txt");
-    cache = (p && [[NSFileManager defaultManager] fileExistsAtPath:p]) ? 1 : 0;
-    return cache == 1;
+    return (p && [[NSFileManager defaultManager] fileExistsAtPath:p]) ? YES : NO;
 }
 
 static int DYTypeValue(void) {
@@ -172,52 +160,61 @@ static int DYTypeValue(void) {
     return cache;
 }
 
-/* ===================== 调用栈反查 ===================== */
-static void DYDumpStack(const char *tag) {
-    void *bt[12];
-    int n = backtrace(bt, 12);
-    L(@"[STACK %s] %d 帧：", tag, n);
-    for (int i = 1; i < n && i < 10; i++) {
-        Dl_info info;
-        if (dladdr(bt[i], &info) && info.dli_fname) {
-            const char *base = strrchr(info.dli_fname, '/');
-            base = base ? base + 1 : info.dli_fname;
-            uintptr_t off = (uintptr_t)bt[i] - (uintptr_t)info.dli_fbase;
-            L(@"[STACK %s]   #%d %s+0x%lx %s", tag, i, base,
-              (unsigned long)off, info.dli_sname ? info.dli_sname : "");
-        } else {
-            L(@"[STACK %s]   #%d %p (无符号信息)", tag, i, bt[i]);
+/* ===================== 找自己的 uid / sec_uid ===================== */
+static void DYFindMyUser(void) {
+    @try {
+        NSDictionary *all = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+        NSMutableArray *hits = [NSMutableArray array];
+        NSMutableArray *keys = [NSMutableArray arrayWithArray:[all allKeys]];
+        for (NSString *k in keys) {
+            if (![k isKindOfClass:[NSString class]]) continue;
+            NSString *lk = [k lowercaseString];
+            BOOL want = ([lk containsString:@"sec_uid"] || [lk containsString:@"secuid"]
+                         || [lk containsString:@"user_id"] || [lk containsString:@"userid"]
+                         || [lk isEqualToString:@"uid"]);
+            if (!want) continue;
+            id v = all[k];
+            if (!([v isKindOfClass:[NSString class]] || [v isKindOfClass:[NSNumber class]])) continue;
+            NSString *sv = [v description];
+            if (sv.length == 0 || sv.length > 200) continue;
+            [hits addObject:[NSString stringWithFormat:@"%@=%@", k, sv]];
+            NSString *lk2 = lk;
+            if ([lk2 containsString:@"sec"]) { if (!g_mySecUid) g_mySecUid = [sv copy]; }
+            else if (!g_myUid) g_myUid = [sv copy];
         }
-    }
+        if (hits.count) {
+            NSUInteger lim = hits.count > 30 ? 30 : hits.count;
+            L(@"[MYUSER] NSUserDefaults 里找到 %lu 条 uid 相关项：", (unsigned long)hits.count);
+            for (NSUInteger i = 0; i < lim; i++) L(@"[MYUSER]   %@", hits[i]);
+        } else {
+            L(@"[MYUSER] NSUserDefaults 里没有 uid 相关项，下一版改用账号服务取");
+        }
+    } @catch (...) { L(@"[MYUSER] 读取异常"); }
+    L(@"[MYUSER] 采用值：uid=%@ sec_uid=%@", g_myUid ?: @"(空)", g_mySecUid ?: @"(空)");
 }
 
-/* ===================== 请求体探测 ===================== */
+/* ===================== 抓 body / response ===================== */
 static BOOL DYInteresting(NSString *s) {
     if (s.length < 8) return NO;
-    if ([s containsString:@"comment"]) return YES;
-    if ([s containsString:@"text_extra"]) return YES;
-    if ([s containsString:@"textExtra"]) return YES;
-    if ([s containsString:@"comment_text_extra"]) return YES;
-    if ([s containsString:@"aweme_id"]) return YES;
+    if ([s containsString:@"publish_scene"]) return YES;      /* 评论发布请求 */
+    if ([s containsString:@"text_extra"]) return YES;         /* 任何带 text_extra 的 */
+    if ([s containsString:@"comment"] && s.length < 8000) return YES;
+    if ([s containsString:@"aweme_id"] && s.length < 8000) return YES;
     return NO;
 }
 
 static NSString *DYBodyRepr(id arg) {
     if (!arg) return nil;
     @try {
-        if ([arg isKindOfClass:[NSString class]]) {
-            return (NSString *)arg;
-        }
+        if ([arg isKindOfClass:[NSString class]]) return (NSString *)arg;
         if ([arg isKindOfClass:[NSData class]]) {
             NSData *d = (NSData *)arg;
             if (d.length == 0 || d.length > 400000) return nil;
-            /* 评论 body 是 form-urlencoded / JSON，纯文本可解 */
             NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
             if (s.length) return s;
-            /* 可能是 zstd 压缩体（v17 见过 28 b5 2f fd），只报魔数 */
             const unsigned char *b = (const unsigned char *)d.bytes;
             if (d.length >= 4 && b[0] == 0x28 && b[1] == 0xb5 && b[2] == 0x2f && b[3] == 0xfd) {
-                return @"<zstd 压缩体，无法直接读>";
+                return @"<zstd 压缩体>";
             }
             return nil;
         }
@@ -226,175 +223,162 @@ static NSString *DYBodyRepr(id arg) {
             if (d) return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
             return [arg description];
         }
-        if ([arg isKindOfClass:[NSURL class]]) return [(NSURL *)arg absoluteString];
     } @catch (...) { return @"(取值异常)"; }
     return nil;
 }
 
-/* 统一的命中处理：只打「像评论请求」的内容 */
-static void DYOnBody(id arg, const char *clsName, const char *selName) {
+/* 把 needle 前后文整段打出来 —— 响应体很长时也能定位 text_extra */
+static void DYEmitAround(NSString *s, NSString *needle, int idx, NSString *label) {
+    NSRange r = [s rangeOfString:needle];
+    if (r.location == NSNotFound) return;
+    NSUInteger start = r.location > 300 ? r.location - 300 : 0;
+    NSUInteger end = NSMaxRange(r) + 500;
+    if (end > s.length) end = s.length;
+    NSString *seg = [s substringWithRange:NSMakeRange(start, end - start)];
+    LFast([NSString stringWithFormat:@"[%@ #%d] 命中「%@」上下文：%@", label, idx, needle, seg]);
+}
+
+static void DYOnBody(id arg, const char *clsName, const char *selName, BOOL isResp) {
+    if (isResp) {
+        NSString *repr = DYBodyRepr(arg);
+        if (!repr.length) return;
+        if (![repr containsString:@"text_extra"] && ![repr containsString:@"publish_scene"]) return;
+        g_respHit++;
+        if (g_respHit > 20) return;
+        LFast([NSString stringWithFormat:@"\n===== [RESP #%d] %s -%s （长度 %lu）=====", g_respHit, clsName, selName, (unsigned long)repr.length]);
+        DYEmitAround(repr, @"text_extra", g_respHit, @"RESP");
+        if (![repr containsString:@"text_extra"]) {
+            NSString *shown = repr.length > 1500 ? [repr substringToIndex:1500] : repr;
+            LFast([NSString stringWithFormat:@"[RESP #%d] 无 text_extra，前段：%@", g_respHit, shown]);
+        }
+        return;
+    }
+
     g_bodySeen++;
-    if (g_bodySeen > 40000) return;        /* 硬闸：避免高频 setter 拖慢主线程 */
+    if (g_bodySeen > 40000) return;
     NSString *repr = DYBodyRepr(arg);
     if (!repr.length) return;
     if (!DYInteresting(repr)) return;
 
+    /* 同一份 body 只打一次（同一请求常被 setBody 调用两次） */
+    NSString *head = repr.length > 300 ? [repr substringToIndex:300] : repr;
+    if (g_lastBody && [g_lastBody isEqualToString:head]) return;
+    g_lastBody = [head copy];
+
     g_bodyHit++;
-    if (g_bodyHit > 40) return;   /* 命中太多只留前 40 条，避免刷屏 */
+    if (g_bodyHit > 30) return;
 
     NSString *shown = repr.length > DY_MAXLEN ? [[repr substringToIndex:DY_MAXLEN] stringByAppendingString:@"…<截断>"] : repr;
-    NSString *tls = g_tlsURL[0] ? [NSString stringWithUTF8String:g_tlsURL] : @"";
     LFast([NSString stringWithFormat:@"\n===== [BODY #%d] %s -%s =====", g_bodyHit, clsName, selName]);
-    if (tls.length) LFast([NSString stringWithFormat:@"[BODY #%d] 同线程最近 URL: %@", g_bodyHit, tls]);
     LFast([NSString stringWithFormat:@"[BODY #%d] 长度 %lu：%@", g_bodyHit, (unsigned long)repr.length, shown]);
+    if ([repr containsString:@"text_extra"]) DYEmitAround(repr, @"text_extra", g_bodyHit, @"BODY");
 }
 
-/* 显式 hook 一个单参数 setter */
+/* ===================== 显式 hook NSMutableURLRequest ===================== */
 static IMP g_origSetHTTPBody = NULL;
-static IMP g_origSetURL = NULL;
-
 static void dy_setHTTPBody(id self, SEL _cmd, id arg) {
-    @try {
-        if (g_origSetHTTPBody) ((void (*)(id, SEL, id))g_origSetHTTPBody)(self, _cmd, arg);
-    } @catch (...) {}
-    @try { DYOnBody(arg, "NSMutableURLRequest", "setHTTPBody:"); } @catch (...) {}
+    @try { if (g_origSetHTTPBody) ((void (*)(id, SEL, id))g_origSetHTTPBody)(self, _cmd, arg); } @catch (...) {}
+    @try { DYOnBody(arg, "NSMutableURLRequest", "setHTTPBody:", NO); } @catch (...) {}
 }
 
-static void dy_setURL(id self, SEL _cmd, id arg) {
-    @try {
-        if ([arg isKindOfClass:[NSURL class]]) {
-            const char *u = [[(NSURL *)arg absoluteString] UTF8String];
-            if (u) { strncpy(g_tlsURL, u, sizeof(g_tlsURL) - 1); g_tlsURL[sizeof(g_tlsURL) - 1] = 0; }
-        }
-    } @catch (...) {}
-    @try {
-        if (g_origSetURL) ((void (*)(id, SEL, id))g_origSetURL)(self, _cmd, arg);
-    } @catch (...) {}
-}
-
-/* 运行时扫描：类名含网络关键词 + 精确 setter 名 + 参数是对象 → hook */
+/* ===================== 运行时扫描 ===================== */
 static const char *kSetters[] = {
     "setBody:", "setPostData:", "setBodyData:", "setHttpBody:",
     "setRequestBody:", "setPostBody:", "setRequestData:",
     "setPostBodyData:", "setHttpBodyData:", "setFormData:",
-    "setPostParams:", "setParameters:", "setRequestParams:"
+    "setPostParams:", "setParameters:", "setRequestParams:",
+    "setResponseBody:", "setRawData:", "setResponseData:"
 };
 static const int kSetterCount = sizeof(kSetters) / sizeof(kSetters[0]);
 
-static const char *kClsKeys[] = {
-    "Net", "Network", "Http", "Request", "Task", "Api", "Channel", "Session", "Client"
-};
-static const int kClsKeyCount = sizeof(kClsKeys) / sizeof(kClsKeys[0]);
-
-/* 强网络特征：先挂这些，避免被一堆业务 Request 类占满名额 */
 static const char *kStrongKeys[] = { "Net", "Network", "Http", "Channel" };
 static const int kStrongCount = sizeof(kStrongKeys) / sizeof(kStrongKeys[0]);
+static const char *kWeakKeys[] = { "Request", "Task", "Api", "Session", "Client" };
+static const int kWeakCount = sizeof(kWeakKeys) / sizeof(kWeakKeys[0]);
 
-static BOOL DYClassMatches(const char *name) {
+static BOOL DYHasKey(const char *name, const char **keys, int n) {
     if (!name) return NO;
-    for (int i = 0; i < kClsKeyCount; i++) {
-        if (strstr(name, kClsKeys[i])) return YES;
-    }
-    return NO;
-}
-
-static BOOL DYStrongMatch(const char *name) {
-    if (!name) return NO;
-    for (int i = 0; i < kStrongCount; i++) {
-        if (strstr(name, kStrongKeys[i])) return YES;
-    }
+    for (int i = 0; i < n; i++) if (strstr(name, keys[i])) return YES;
     return NO;
 }
 
 static int g_hookN = 0;
-static int g_scanCls = 0;
-static int g_scanMatch = 0;
 
-/* pass: 0 = 只挂强网络类；1 = 只挂弱匹配类 */
+/* pass 0 = 强网络类 / 1 = 弱匹配类 / 2 = Response 类 */
 static int DYScanPass(int pass) {
     int total = objc_getClassList(NULL, 0);
-    if (total <= 0) { L(@"[SCAN] 类表读取失败"); return 0; }
+    if (total <= 0) return 0;
     Class *list = (Class *)malloc(sizeof(Class) * total);
-    if (!list) { L(@"[SCAN] 内存不足"); return 0; }
+    if (!list) return 0;
     total = objc_getClassList(list, total);
-    g_scanCls = total;
-    int hookedThisPass = 0;
+    int hooked = 0;
 
     for (int i = 0; i < total && g_hookN < DY_MAXHOOK; i++) {
         Class c = list[i];
         if (!c) continue;
         const char *cn = class_getName(c);
-        if (!DYClassMatches(cn)) continue;
-        BOOL strong = DYStrongMatch(cn);
-        if (pass == 0 && !strong) continue;
-        if (pass == 1 && strong) continue;
-        g_scanMatch++;
+        BOOL strong = DYHasKey(cn, kStrongKeys, kStrongCount);
+        BOOL weak = DYHasKey(cn, kWeakKeys, kWeakCount);
+        BOOL isResp = (strstr(cn, "Response") != NULL);
+        BOOL want = NO;
+        if (pass == 0 && strong) want = YES;
+        if (pass == 1 && weak && !strong) want = YES;
+        if (pass == 2 && isResp) want = YES;
+        if (!want) continue;
 
-        for (int k = 0; k < kSetterCount && g_hookN < DY_MAXHOOK; k++) {
-            SEL want = sel_registerName(kSetters[k]);
+        const char *mod = class_getImageName(c);
+        if (mod && strstr(mod, "/System/Library/")) continue;
 
-            /* 只处理「本类自己实现」的方法：用 copyMethodList 而不是 class_getInstanceMethod，
-               否则会改到父类的方法，多个子类重复 hook 会串成链，最终崩溃 */
-            unsigned int mcount = 0;
-            Method *mlist = class_copyMethodList(c, &mcount);
-            if (!mlist) continue;
-            Method m = NULL;
-            for (unsigned int mi = 0; mi < mcount; mi++) {
-                if (method_getName(mlist[mi]) == want) { m = mlist[mi]; break; }
+        unsigned int mcount = 0;
+        Method *mlist = class_copyMethodList(c, &mcount);
+        if (!mlist) continue;
+
+        for (unsigned int mi = 0; mi < mcount && g_hookN < DY_MAXHOOK; mi++) {
+            const char *sn = sel_getName(method_getName(mlist[mi]));
+            if (!sn) continue;
+            BOOL matched = NO;
+            for (int k = 0; k < kSetterCount; k++) {
+                if (strcmp(sn, kSetters[k]) == 0) { matched = YES; break; }
             }
-            if (!m) { free(mlist); continue; }
+            if (!matched) continue;
 
-            /* 关键防护：必须恰好 self/_cmd/obj 三个参数，第 3 个是对象，且返回 void */
-            unsigned int argc = method_getNumberOfArguments(m);
-            if (argc != 3) { free(mlist); continue; }
+            Method m = mlist[mi];
+            if (method_getNumberOfArguments(m) != 3) continue;
             char tbuf[8] = {0};
             method_getArgumentType(m, 2, tbuf, sizeof(tbuf));
-            if (tbuf[0] != '@') { free(mlist); continue; }
+            if (tbuf[0] != '@') continue;
             char rbuf[8] = {0};
             method_getReturnType(m, rbuf, sizeof(rbuf));
-            if (rbuf[0] != 'v') { free(mlist); continue; }
-
-            /* 系统库里的类已经显式处理过，跳过 */
-            const char *mod = class_getImageName(c);
-            if (mod && strstr(mod, "/System/Library/")) { free(mlist); continue; }
+            if (rbuf[0] != 'v') continue;
 
             char *dumpCls = strdup(cn);
-            char *dumpSel = strdup(kSetters[k]);
-            if (!dumpCls || !dumpSel) { if (dumpCls) free(dumpCls); if (dumpSel) free(dumpSel); free(mlist); continue; }
+            char *dumpSel = strdup(sn);
+            if (!dumpCls || !dumpSel) { if (dumpCls) free(dumpCls); if (dumpSel) free(dumpSel); continue; }
 
             IMP orig = method_getImplementation(m);
-            SEL origSel = want;
+            SEL origSel = method_getName(m);
+            BOOL resp = isResp;
             id block = ^(id self_, id arg) {
-                /* 必须把 arg 传回原实现，否则原逻辑拿不到 body */
                 @try { if (orig) ((void (*)(id, SEL, id))orig)(self_, origSel, arg); } @catch (...) {}
-                @try { DYOnBody(arg, dumpCls, dumpSel); } @catch (...) {}
+                @try { DYOnBody(arg, dumpCls, dumpSel, resp); } @catch (...) {}
             };
-            IMP newImp = imp_implementationWithBlock(block);
-            method_setImplementation(m, newImp);
-            free(mlist);
+            method_setImplementation(m, imp_implementationWithBlock(block));
             g_hookN++;
-            hookedThisPass++;
+            hooked++;
         }
+        free(mlist);
     }
     free(list);
-    return hookedThisPass;
+    return hooked;
 }
 
-static void DYScanAndHook(void) {
-    int a = DYScanPass(0);
-    int b = DYScanPass(1);
-    L(@"[SCAN] 类总数 %d，强网络类命中 %d 个 hook，其它命中 %d 个 hook，合计 %d",
-      g_scanCls, a, b, g_hookN);
-}
-
-/* ===================== extraInfo 结构情报 ===================== */
+/* ===================== extraInfo 结构 ===================== */
 static void DYDumpObjectFields(id o, NSString *tag) {
     if (!o) return;
     Class c = object_getClass(o);
     if (!c) return;
     L(@"[EI] %@ 元素类 = %s", tag, class_getName(c));
 
-    /* 候选选择器安全取值（只取能安全转成字符串/数字的） */
     NSArray *cands = @[@"start", @"end", @"type", @"subType", @"sub_type",
                        @"userId", @"user_id", @"secUid", @"sec_uid",
                        @"hashtagName", @"hashTagName", @"hashtagId",
@@ -430,27 +414,9 @@ static void DYDumpObjectFields(id o, NSString *tag) {
     }
     if (vals.count) L(@"[EI] %@ 取值: %@", tag, [vals componentsJoinedByString:@", "]);
     else L(@"[EI] %@ 候选选择器全部取不到值", tag);
-
-    /* ivar 兜底（Swift/KMP 类属性 0 个，但 ivar 有东西） */
-    int lvl = 0;
-    Class cur = c;
-    while (cur && cur != [NSObject class] && lvl < 2) {
-        unsigned int n = 0;
-        Ivar *iv = class_copyIvarList(cur, &n);
-        NSMutableArray *a = [NSMutableArray array];
-        for (unsigned int i = 0; i < n && i < 30; i++) {
-            const char *nm = ivar_getName(iv[i]);
-            const char *tp = ivar_getTypeEncoding(iv[i]);
-            if (nm) [a addObject:[NSString stringWithFormat:@"%s:%s", nm, tp ? tp : "?"]];
-        }
-        if (iv) free(iv);
-        if (n) L(@"[EI] %@ ivar(%s) %u 个: %@", tag, class_getName(cur), n, [a componentsJoinedByString:@", "]);
-        cur = class_getSuperclass(cur);
-        lvl++;
-    }
 }
 
-/* ===================== 注入（沿用 v23） ===================== */
+/* ===================== 注入 ===================== */
 static NSString *DYBuildTextExtra(NSString *text, int type) {
     if (![text isKindOfClass:[NSString class]] || text.length == 0) return nil;
     NSUInteger bytes = [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
@@ -460,6 +426,8 @@ static NSString *DYBuildTextExtra(NSString *text, int type) {
     span[@"start"] = @0;
     span[@"end"] = @(bytes);
     span[@"type"] = @(type);
+    if (g_myUid.length) span[@"user_id"] = g_myUid;
+    if (g_mySecUid.length) span[@"sec_uid"] = g_mySecUid;
 
     NSData *d = [NSJSONSerialization dataWithJSONObject:@[ span ] options:0 error:NULL];
     if (!d) return nil;
@@ -470,17 +438,9 @@ static id dy_extraParams(id self, SEL _cmd) {
     id r = nil;
     @try { if (g_origExtraParams) r = ((id (*)(id, SEL))g_origExtraParams)(self, _cmd); } @catch (...) {}
 
-    /* 只在前 3 次打印调用栈（回答「谁在读这个字典」） */
-    if (g_injectN < 3) {
-        @try { DYDumpStack("G-extraParams"); } @catch (...) {}
-    }
+    if (![r isKindOfClass:[NSDictionary class]]) return r;
 
-    if (![r isKindOfClass:[NSDictionary class]]) {
-        if (g_injectN < 3) { g_injectN++; L(@"[INJECT] extraParams 不是字典（%@），跳过", r ? NSStringFromClass([r class]) : @"nil"); }
-        return r;
-    }
-
-    /* 【最重要】原生已经有 text_extra 时（带话题/艾特的评论），原样打出来 —— 这是 iOS 端真实格式 */
+    /* 原生已有 text_extra 时（带话题/艾特的评论）打出来 —— iOS 端真实格式 */
     if (g_rawN < 3) {
         NSArray *keyCands = @[@"text_extra", @"textExtra", @"text_extra_list", @"comment_text_extra"];
         for (NSString *k in keyCands) {
@@ -495,19 +455,17 @@ static id dy_extraParams(id self, SEL _cmd) {
     }
 
     if (DYSwitchOff()) {
-        if (g_injectN < 3) { g_injectN++; L(@"[INJECT] 检测到 dyprobe_off.txt，本版不注入（对照组）"); }
+        if (g_injectN < 2) { g_injectN++; L(@"[INJECT] dyprobe_off.txt 存在 → 不注入（观察原生）"); }
         return r;
     }
 
     NSString *text = nil;
     @try { text = [self valueForKeyPath:@"contentModel.content"]; } @catch (...) {}
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return r;
 
     int type = DYTypeValue();
     NSString *js = DYBuildTextExtra(text, type);
-    if (!js) {
-        if (g_injectN < 3) { g_injectN++; L(@"[INJECT] 正文为空或取不到（text=%@），跳过", DYStr(text)); }
-        return r;
-    }
+    if (!js) return r;
 
     NSMutableDictionary *m = [r mutableCopy];
     m[@"text_extra"] = js;
@@ -515,76 +473,59 @@ static id dy_extraParams(id self, SEL _cmd) {
     if (g_injectN < 6) {
         g_injectN++;
         L(@"[INJECT #%d] type=%d 正文=「%@」(%lu 字节) → text_extra=%@",
-          g_injectN, type, text, (unsigned long)[text lengthOfBytesUsingEncoding:NSUTF8StringEncoding], js);
+          g_injectN, type, text,
+          (unsigned long)[text lengthOfBytesUsingEncoding:NSUTF8StringEncoding], js);
     }
     return m;
 }
 
 /* ===================== 安装 ===================== */
 static void DYInstall(void) {
-    /* 一、注入 */
+    DYFindMyUser();
+
     Class pm = objc_getClass("AWECommentPublishParameterModel");
     if (pm) {
-        SEL sel = sel_registerName("extraParams");
-        Method m = class_getInstanceMethod(pm, sel);
+        Method m = class_getInstanceMethod(pm, sel_registerName("extraParams"));
         if (m) {
             g_origExtraParams = method_setImplementation(m, (IMP)dy_extraParams);
-            L(@"[HOOK] -extraParams 已接管（注入 text_extra），默认 type=%d", DYTypeValue());
-        } else {
-            L(@"[FATAL] -extraParams 不存在，注入不可用");
+            L(@"[HOOK] -extraParams 已接管，默认 type=%d", DYTypeValue());
         }
-    } else {
-        L(@"[FATAL] AWECommentPublishParameterModel 不存在");
     }
 
-    /* 二、extraInfo 写入时 dump 结构（原生路径模板） */
     Class icm = objc_getClass("AWECommentInputContentModel");
     if (icm) {
-        SEL sel = sel_registerName("setExtraInfo:");
-        Method m = class_getInstanceMethod(icm, sel);
+        Method m = class_getInstanceMethod(icm, sel_registerName("setExtraInfo:"));
         if (m) {
-            __block IMP orig = method_getImplementation(m);
-            SEL origSel = sel;
+            IMP orig = method_getImplementation(m);
+            SEL origSel = sel_registerName("setExtraInfo:");
             id block = ^(id self_, id arg) {
                 @try { if (orig) ((void (*)(id, SEL, id))orig)(self_, origSel, arg); } @catch (...) {}
                 @try {
                     if (!arg || ![arg isKindOfClass:[NSArray class]]) return;
                     NSArray *a = (NSArray *)arg;
-                    if (a.count == 0) return;
-                    if (g_extraN >= 3) return;
+                    if (a.count == 0 || g_extraN >= 2) return;
                     g_extraN++;
-                    L(@"\n===== [EI #%d] extraInfo 被写入 %lu 个元素 =====", g_extraN, (unsigned long)a.count);
+                    L(@"\n===== [EI #%d] extraInfo 写入 %lu 个元素 =====", g_extraN, (unsigned long)a.count);
                     NSUInteger lim = a.count > 4 ? 4 : a.count;
                     for (NSUInteger i = 0; i < lim; i++) {
                         DYDumpObjectFields(a[i], [NSString stringWithFormat:@"#%d-%lu", g_extraN, (unsigned long)i]);
                     }
                 } @catch (...) {}
             };
-            IMP newImp = imp_implementationWithBlock(block);
-            method_setImplementation(m, newImp);
-            L(@"[HOOK] -setExtraInfo: 已接管（非空时 dump 元素结构）");
+            method_setImplementation(m, imp_implementationWithBlock(block));
+            L(@"[HOOK] -setExtraInfo:");
         }
     }
 
-    /* 三、显式 hook NSMutableURLRequest */
     Class req = objc_getClass("NSMutableURLRequest");
     if (req) {
         Method m1 = class_getInstanceMethod(req, sel_registerName("setHTTPBody:"));
-        if (m1) {
-            g_origSetHTTPBody = method_setImplementation(m1, (IMP)dy_setHTTPBody);
-            L(@"[HOOK] NSMutableURLRequest -setHTTPBody:");
-        }
-        Method m2 = class_getInstanceMethod(req, sel_registerName("setURL:"));
-        if (m2) {
-            g_origSetURL = method_setImplementation(m2, (IMP)dy_setURL);
-            L(@"[HOOK] NSMutableURLRequest -setURL:");
-        }
+        if (m1) g_origSetHTTPBody = method_setImplementation(m1, (IMP)dy_setHTTPBody);
     }
 
-    /* 四、扫描网络类的 body setter */
-    DYScanAndHook();
-
-    L(@"[DONE] v24 安装完成");
+    int a = DYScanPass(0), b = DYScanPass(1), c = DYScanPass(2);
+    L(@"[SCAN] 强网络 %d / 其它 %d / 响应 %d，合计 %d 个 hook", a, b, c, g_hookN);
+    L(@"[DONE] v25 安装完成");
 }
 
 /* ===================== 入口 ===================== */
@@ -594,20 +535,18 @@ __attribute__((constructor)) static void DYInit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            L(@"\n========== [v24] 安装开始 %@ ==========", [NSDate date]);
-            @try { DYInstall(); } @catch (...) { L(@"[v24] 安装异常，已忽略"); }
-            L(@"[v24] 请发一条带话题的评论：#测试 你好   （这条必然生成 text_extra）");
-            L(@"[v24] 再发一条纯文本 tt21，然后杀进程导出 Documents/dyprobe_v24.txt");
+            L(@"\n========== [v25] 安装开始 %@ ==========", [NSDate date]);
+            @try { DYInstall(); } @catch (...) { L(@"[v25] 安装异常，已忽略"); }
+            L(@"[v25] 发一条 tt21。重点看日志里 [RESP #n] 有没有 text_extra");
         }
     });
 
-    /* 心跳 */
-    for (int i = 1; i <= 6; i++) {
+    for (int i = 1; i <= 8; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 15.0 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
             @autoreleasepool {
-                L(@"[心跳 %ds] 已写 %d 行 / body 见过 %d 次 / 命中 %d 次",
-                  i * 15, g_writes, g_bodySeen, g_bodyHit);
+                L(@"[心跳 %ds] 行 %d / body %d / 命中 %d / 响应命中 %d",
+                  i * 15, g_writes, g_bodySeen, g_bodyHit, g_respHit);
             }
         });
     }
