@@ -50,6 +50,8 @@ static NSInteger gStackCount = 0;
 static NSInteger gParamDumpCount = 0;
 static NSInteger gLastContentLen = 0;
 static NSInteger gModelTypeHit = 0;   /* v9: setType 写入 21 的次数 */
+static NSInteger gRedSampleDump = 0;  /* v9.1: 真实红字对象(type=21)完整结构 dump 次数，限 3 */
+static NSInteger gPubObjDump = 0;     /* v9.1: 发布 @ 对象完整结构 dump 次数，限 3 */
 
 static void DYAppend(NSString *line) {
     if (!gBuf) gBuf = [NSMutableString string];
@@ -183,6 +185,13 @@ static void dy_setType_int(id self, SEL _cmd, long long v) {
                       (long)gSetTypeCalls, v, NSStringFromClass([self class])]);
             DYFlushLog();
         }
+        /* v9.1: App 自己传入 21 = 一条真实红字评论的 textExtra 对象，抓全字段当模板 */
+        if (v == 21 && gRedSampleDump < 3) {
+            gRedSampleDump++;
+            DYAppend([NSString stringWithFormat:@"===== [RED-SAMPLE #%ld] iOS 本地真实红字 type=21 对象完整结构 =====", (long)gRedSampleDump]);
+            DYAppend(DYSafeFull(self));
+            DYFlushLog();
+        }
     } @catch (...) {}
     if (gOrigSetType && gOrigSetType != (IMP)dy_setType_int) {
         @try { ((void(*)(id,SEL,long long))gOrigSetType)(self, _cmd, v); } @catch (...) {}
@@ -293,6 +302,13 @@ static void DYMutateExtraInfo(id arr, NSString *tag) {
                 id tv = nil;
                 @try { tv = [e valueForKey:@"type"]; } @catch (...) {}
                 DYAppend([NSString stringWithFormat:@"[EXTRAINFO] %@ [%lu] %@ type=%@", tag, (unsigned long)i, cn, DYSafe(tv)]);
+                /* v9.1: 发布 @ 对象完整字段，和 RED-SAMPLE 对照，看真实红字到底多了哪些键 */
+                if ([cn isEqualToString:@"AWETextExtra"] && gPubObjDump < 3) {
+                    gPubObjDump++;
+                    DYAppend([NSString stringWithFormat:@"===== [PUB-OBJ #%ld] 发布 @ 对象完整结构(type=%@) =====", (long)gPubObjDump, DYSafe(tv)]);
+                    DYAppend(DYSafeFull(e));
+                    DYFlushLog();
+                }
                 if (![cn isEqualToString:@"AWETextExtra"]) continue;
                 /* 用 setType: 的原始 IMP 写入 21，绕开本插件的只读 dy_setType_int */
                 IMP realSetType = gOrigSetType;
@@ -540,7 +556,7 @@ __attribute__((constructor)) static void DYInit(void) {
         gOrigBySel = [NSMutableDictionary dictionary];
         gHookedKeys = [NSMutableSet set];
         gSeenHits = [NSMutableSet set];
-        DYAppend(@"DYProbe v9 init (extraParams 注入 + extraInfo.type 0->21 写入)");
+        DYAppend(@"DYProbe v9.1 init (extraParams 注入 + extraInfo.type 0->21 写入 + 抓真实红字模板对照)");
         DYFlushLog();
     }
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
