@@ -3,7 +3,7 @@
 #import <objc/runtime.h>
 
 /*
- * DYProbe v3 - 抖音 41.0.0 评论 textExtra 结构探针（防闪退版）
+ * DYProbe v4 - 抖音 41.0.0 评论 textExtra 结构探针（防闪退版）
  * 纯 Objective-C runtime swizzle，不依赖 Cydia Substrate / Logos。
  *
  * v3 相对 v2 的关键修复（v2 因深度 dump 高频 model 导致闪退）：
@@ -120,7 +120,7 @@ static void DYPop(void) {
         if (!vc) return;
         @try {
             NSString *preview = gBuf ? (gBuf.length > 400 ? [gBuf substringToIndex:400] : gBuf) : @"(empty)";
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v3 已捕获"
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v4 已捕获"
                 message:[NSString stringWithFormat:@"命中 %ld 次，已复制到剪贴板。\n\n---- 预览 ----\n%@", (long)gHit, preview]
                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"再复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ DYCopyToPasteboard(); }]];
@@ -132,9 +132,9 @@ static void DYPop(void) {
 
 /* 频率闸门：返回 YES 才允许本次 dump */
 static BOOL DYGate(void) {
-    if (gDumpCount >= 20) return NO;
+    if (gDumpCount >= 60) return NO;
     NSDate *now = [NSDate date];
-    if (gLastDump && [now timeIntervalSinceDate:gLastDump] < 0.3) return NO;
+    if (gLastDump && [now timeIntervalSinceDate:gLastDump] < 0.15) return NO;
     gLastDump = now;
     gDumpCount++;
     return YES;
@@ -169,24 +169,34 @@ static void dy_dump_1(id self, SEL _cmd, id arg) {
     } @catch (...) {}
 }
 
-/* 按签名选 IMP，只 hook 返回 void + 纯对象参数的方法 */
+/*
+ * 按签名选 IMP（v4 修正）：参数个数 = _cmd 冒号【之后】的对象 token 数。
+ * v1-v3 错误地数了整个串里的冒号数，导致单参 setter 被当成无参方法。
+ *   v@:    -> 0 参 -> dy_dump_0
+ *   v@:@   -> 1 参 -> dy_dump_1   (如 setTextExtras: v24@0:8@16)
+ *   v@:@@  -> 2 参 -> 跳过（防崩）
+ *   v@:@"NSArray" -> 1 参（引号内类名跳过）
+ */
 static IMP DYPickIMP(const char *enc) {
-    if (!enc) return NULL;
+    if (!enc || enc[0] != 'v') return NULL;   // 只 hook void 返回
+    // 去掉 offset / frame size 数字： v24@0:8@16 -> v@:@
     NSMutableString *t = [NSMutableString string];
     for (const char *p=enc; *p; p++) if (*p < '0' || *p > '9') [t appendFormat:@"%c", *p];
     NSString *sig = t;
-    if (![sig hasPrefix:@"v"]) return NULL;
-    NSUInteger colons = 0;
-    BOOL onlyObj = YES;
-    for (NSUInteger i=1;i<sig.length;i++) {
-        unichar c = [sig characterAtIndex:i];
-        if (c == ':') colons++;
-        else if (c == '@' || c == '"') continue;
-        else if (c=='{'||c=='('||c=='['||c=='^'||c=='#'||c=='*'||c=='?'||c=='B'||c=='c'||c=='i'||c=='s'||c=='l'||c=='q'||c=='f'||c=='d'||c=='C'||c=='I'||c=='S'||c=='L'||c=='Q'||c=='D'||c=='v') { onlyObj = NO; break; }
+    NSRange colon = [sig rangeOfString:@":"];
+    if (colon.location == NSNotFound) return NULL;
+    NSString *args = [sig substringFromIndex:colon.location + 1];  // _cmd 之后才是参数
+    NSInteger objCount = 0;
+    BOOL inQuote = NO;
+    for (NSUInteger i=0; i<args.length; i++) {
+        unichar c = [args characterAtIndex:i];
+        if (c == '"') { inQuote = !inQuote; continue; }   // @"ClassName" / @"<Protocol>"
+        if (inQuote) continue;
+        if (c == '@') objCount++;
+        else return NULL;   // 出现非对象参数（标量/结构体/block）→ 跳过，防崩
     }
-    if (!onlyObj) return NULL;
-    if (colons == 1) return (IMP)dy_dump_0;
-    if (colons == 2) return (IMP)dy_dump_1;
+    if (objCount == 0) return (IMP)dy_dump_0;
+    if (objCount == 1) return (IMP)dy_dump_1;
     return NULL;
 }
 
@@ -245,7 +255,7 @@ static void DYBootAlert(void) {
         UIViewController *vc = DYTopVC();
         if (!vc) return;
         @try {
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v3 已加载"
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v4 已加载"
                 message:@"防闪退版。去发一条带 @ 或 # 的评论，探针会抓 textExtra 结构并复制到剪贴板。"
                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"开始测试" style:UIAlertActionStyleCancel handler:nil]];
@@ -270,7 +280,7 @@ __attribute__((constructor)) static void DYInit(void) {
         gBuf = [NSMutableString string];
         gOrigByKey = [NSMutableDictionary dictionary];
         gHookedKeys = [NSMutableSet set];
-        DYAppend(@"DYProbe v3 init (anti-crash)");
+        DYAppend(@"DYProbe v4 init (signature-fixed)");
         DYScanAndHook();
         DYSave();
     }
