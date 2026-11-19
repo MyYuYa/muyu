@@ -1,0 +1,50 @@
+name: Build DYProbe dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: |
+          set -e
+          brew install ldid
+          which ldid
+
+      - name: Show toolchain
+        run: |
+          set -e
+          xcodebuild -version
+          echo "SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang --version | head -2
+
+      - name: Build dylib (plain clang, no Theos/Logos)
+        run: |
+          set -ex
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang -dynamiclib \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=13.0 \
+            -fobjc-arc \
+            -framework Foundation \
+            -framework UIKit \
+            -Wl,-install_name,@rpath/DYProbe.dylib \
+            DYProbe.m -o DYProbe.dylib
+          ldid -S DYProbe.dylib
+          ls -lh DYProbe.dylib
+          file DYProbe.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DYProbe-dylib
+          path: DYProbe.dylib
+          if-no-files-found: error
