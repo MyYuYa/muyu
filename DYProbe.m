@@ -1,373 +1,268 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
 #import <string.h>
+#import <stdlib.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
+#import <mach/vm_prot.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 
 /*
- * DYProbe v13 — 纯只读诊断探针（零注入 / 零 KVC / 零返回值修改）
- * ------------------------------------------------------------------
- * 目的：一次性抓清 iOS 抖音 41.0.0 评论发布链路的【真实 body 结构】与【有效 hook 点】。
+ * DYProbe v14 — BoringSSL Pinning Bypass（只做一件事：让 Charles 能看到抖音明文）
+ * ============================================================================
+ * 为什么这一版不会闪退（设计原则：失败也不崩）：
+ *   1) 不 hook 任何 ObjC 方法、不扫类、不碰任何业务对象。
+ *   2) 只用 fishhook 改 boringssl 外部符号的 GOT 指针（纯数据指针替换）。
+ *   3) 每个替换函数都判空后转发；hook 不到就什么都不做，App 照常跑。
  *
- * 根因（41.0.0 砸壳二进制静态分析实锤，不再是猜）：
- *   评论发布走 Swift/KMP 链路：
- *     AWECommentSwiftImpl.CommentPublishRequestProvider
- *     path = aweme/v1/comment/publish/?need_shark_async=1
- *     参数模型 = AWEKMPBaseCommentPublishParameters
- *     textExtra 序列化 = AWEKMPTextExtraStructKMPListSerializer
- *   v5~v12 全部 hook 的是旧 ObjC model（AWECommentPublishParameterModel 那套）
- *   ——与真正发请求的链路不是同一条，所以本地瞬间红、服务端黑。
+ * 技术依据（砸壳包静态分析，已确认）：
+ *   - AwemeCore 通过 LC_LOAD_DYLIB 链接 @rpath/boringssl.framework/boringssl
+ *   - SSL_write / X509_verify_cert / SSL_CTX_set_custom_verify 等 9 个符号
+ *     在 AwemeCore 中均为 N_UNDF（外部导入），可被 fishhook 重绑
+ *   - 网络栈是 TTNet(855) + Cronet(200)，TLS 由 BoringSSL 承担
  *
- * 为什么本版不会再闪退：
- *   v11/v12 崩溃根因是"改"对象——对 Swift/KMP model 做 KVC、mutableCopy 后替换返回值，
- *   触发信号级 EXC_BAD_ACCESS（@try 抓不住）。本版对任何对象只读不改：
- *   trampoline 仅记录参数的 description，然后原样转发给原始 IMP。
+ * hook 三个点（三重保险）：
+ *   A. SSL_CTX_set_custom_verify：把业务传入的校验回调替换为"永远 OK"
+ *      （字节 Pinning 的标准实现方式就是 custom_verify 回调）
+ *   B. X509_verify_cert：直接返回 1（证书链校验通过）
+ *   C. SSL_get_verify_result：返回 0（X509_V_OK）
  *
- * 筛选策略：扫描全类方法，方法名命中评论/body/参数/发布关键词的才挂 hook，
- *   严格 ABI 校验（返回值 @ 或 v，业务参数必须全是对象），其余一律跳过。
- *
- * 用法：装上 -> 弹窗点"开始" -> 发一条普通评论 -> 去 Documents/dyprobe_dump.txt
- *       把日志给我。这次评论不会变红（只读版），目的是拿到 body 结构。
+ * 用法：装上 -> 打开抖音 -> Charles 里刷评论区/发评论 -> 看 amemv.com 是否变明文。
+ *       本版不发红字，只负责"让抓包能看见"。
  */
 
-#define DY_LIMIT 700
+/* ============================ fishhook（内联） ============================ */
+/* 基于 Facebook fishhook (BSD)。补了 iOS 13+ __DATA_CONST 段的 vm_protect，
+ * 否则向只读段写指针会 EXC_BAD_ACCESS —— 这正是很多 fishhook 版本闪退的根因。 */
 
-static NSMutableString *gBuf = nil;
-static NSMutableDictionary *gOrigByHook = nil;   /* key "+-ClassName|sel" -> NSValue(IMP) */
-static NSMutableDictionary *gOrigBySel = nil;    /* fallback by selector name */
-static NSMutableSet *gHookedKeys = nil;
-static NSMutableSet *gSeenHits = nil;
-static NSInteger gDumpCount = 0;
+struct rebinding {
+    const char *name;
+    void *replacement;
+    void **replaced;
+};
 
-/* ---------- 即时落盘（崩溃也不丢最后一行） ---------- */
-static void DYAppend(NSString *line) {
-    if (!gBuf) gBuf = [NSMutableString string];
-    NSString *ln = [NSString stringWithFormat:@"%@\n", line];
-    if (gBuf.length <= 400000) [gBuf appendString:ln];
+struct rebindings_entry {
+    struct rebinding *rebindings;
+    size_t rebindings_nel;
+    struct rebindings_entry *next;
+};
+
+static struct rebindings_entry *_rebindings_head;
+
+/* Apple SDK 中 mach_header_64 / segment_command_64 / section_64 / nlist_64
+ * 都是 struct 标签，没有同名 typedef。必须自建别名，否则编译直接报错。 */
+typedef struct mach_header_64     mach_header_t;
+typedef struct segment_command_64 segment_command_t;
+typedef struct section_64         section_t;
+typedef struct nlist_64           nlist_t;
+
+static int dy_prepend_rebindings(struct rebindings_entry **head,
+                                 struct rebinding rebindings[], size_t nel) {
+    struct rebindings_entry *e = (struct rebindings_entry *)malloc(sizeof(struct rebindings_entry));
+    if (!e) return -1;
+    e->rebindings = (struct rebinding *)malloc(sizeof(struct rebinding) * nel);
+    if (!e->rebindings) { free(e); return -1; }
+    memcpy(e->rebindings, rebindings, sizeof(struct rebinding) * nel);
+    e->rebindings_nel = nel;
+    e->next = *head;
+    *head = e;
+    return 0;
+}
+
+static void dy_rebind_section(struct rebindings_entry *rebindings,
+                              section_t *section, intptr_t slide,
+                              nlist_t *symtab, char *strtab,
+                              uint32_t *indirect_symtab) {
+    uint32_t *indices = indirect_symtab + section->reserved1;
+    void **bindings = (void **)((uintptr_t)slide + section->addr);
+
+    /* 关键：__DATA_CONST 是只读段，必须临时加写权限，否则写指针直接崩。
+     * 加权限失败（chained fixups / 权限策略收紧）就整段跳过——宁可 hook 不生效，也绝不崩。 */
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)bindings, section->size,
+                                  0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) return;
+
+    for (uint32_t i = 0; i < section->size / sizeof(void *); i++) {
+        uint32_t symidx = indices[i];
+        if (symidx == INDIRECT_SYMBOL_ABS || symidx == INDIRECT_SYMBOL_LOCAL ||
+            symidx == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
+
+        uint32_t strx = symtab[symidx].n_un.n_strx;
+        char *symname = strtab + strx;
+        if (!symname[0] || !symname[1]) continue;   /* 需跳过前导 '_' */
+
+        for (struct rebindings_entry *cur = rebindings; cur; cur = cur->next) {
+            for (size_t j = 0; j < cur->rebindings_nel; j++) {
+                if (strcmp(&symname[1], cur->rebindings[j].name) == 0) {
+                    if (cur->rebindings[j].replaced != NULL &&
+                        bindings[i] != cur->rebindings[j].replacement) {
+                        *(cur->rebindings[j].replaced) = bindings[i];
+                    }
+                    bindings[i] = cur->rebindings[j].replacement;
+                }
+            }
+        }
+    }
+}
+
+static void dy_rebind_image(struct rebindings_entry *rebindings,
+                            const struct mach_header *header, intptr_t slide) {
+    if (!rebindings) return;
+    Dl_info info;
+    if (dladdr(header, &info) == 0) return;
+
+    const mach_header_t *mh = (const mach_header_t *)header;
+    segment_command_t *cur_seg = NULL;
+    segment_command_t *linkedit = NULL;
+    struct symtab_command *symtab_cmd = NULL;
+    struct dysymtab_command *dysymtab_cmd = NULL;
+
+    uintptr_t cur = (uintptr_t)header + sizeof(mach_header_t);
+    for (uint32_t i = 0; i < mh->ncmds; i++, cur += cur_seg->cmdsize) {
+        cur_seg = (segment_command_t *)cur;
+        if (cur_seg->cmd == LC_SEGMENT_64) {
+            if (strcmp(cur_seg->segname, SEG_LINKEDIT) == 0) linkedit = cur_seg;
+        } else if (cur_seg->cmd == LC_SYMTAB) {
+            symtab_cmd = (struct symtab_command *)cur_seg;
+        } else if (cur_seg->cmd == LC_DYSYMTAB) {
+            dysymtab_cmd = (struct dysymtab_command *)cur_seg;
+        }
+    }
+    if (!symtab_cmd || !dysymtab_cmd || !linkedit ||
+        !dysymtab_cmd->nindirectsyms) return;
+
+    uintptr_t base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+    nlist_t *symtab = (nlist_t *)(base + symtab_cmd->symoff);
+    char *strtab = (char *)(base + symtab_cmd->stroff);
+    uint32_t *indirect = (uint32_t *)(base + dysymtab_cmd->indirectsymoff);
+
+    cur = (uintptr_t)header + sizeof(mach_header_t);
+    for (uint32_t i = 0; i < mh->ncmds; i++, cur += cur_seg->cmdsize) {
+        cur_seg = (segment_command_t *)cur;
+        if (cur_seg->cmd != LC_SEGMENT_64) continue;
+        if (strcmp(cur_seg->segname, SEG_DATA) != 0 &&
+            strcmp(cur_seg->segname, "__DATA_CONST") != 0) continue;
+        for (uint32_t j = 0; j < cur_seg->nsects; j++) {
+            section_t *sect = (section_t *)(cur + sizeof(segment_command_t)) + j;
+            if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS ||
+                (sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
+                dy_rebind_section(rebindings, sect, slide, symtab, strtab, indirect);
+            }
+        }
+    }
+}
+
+static void dy_rebind_cb(const struct mach_header *header, intptr_t slide) {
+    dy_rebind_image(_rebindings_head, header, slide);
+}
+
+static int dy_rebind_symbols(struct rebinding rebindings[], size_t nel) {
+    if (dy_prepend_rebindings(&_rebindings_head, rebindings, nel) < 0) return -1;
+    if (!_rebindings_head->next) {
+        _dyld_register_func_for_add_image(dy_rebind_cb);
+    } else {
+        uint32_t c = _dyld_image_count();
+        for (uint32_t i = 0; i < c; i++) {
+            dy_rebind_image(_rebindings_head, _dyld_get_image_header(i),
+                            _dyld_get_image_vmaddr_slide(i));
+        }
+    }
+    return 0;
+}
+
+/* ============================ 日志 ============================ */
+static void DYLog(NSString *msg) {
+    NSLog(@"[DYPROBE14] %@", msg);
     @try {
         NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        if (doc) {
-            NSString *path = [doc stringByAppendingPathComponent:@"dyprobe_dump.txt"];
-            NSFileManager *fm = [NSFileManager defaultManager];
-            if (![fm fileExistsAtPath:path]) {
-                [ln writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            } else {
-                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-                if (fh) { [fh seekToEndOfFile]; [fh writeData:[ln dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
-            }
-        }
-    } @catch (...) {}
-    NSLog(@"[DYPROBE] %@", line);
-}
-
-static NSString *DYSafeFull(id obj) {
-    if (!obj) return @"(nil)";
-    @try {
-        NSString *cn = NSStringFromClass([obj class]);
-        if (![obj isKindOfClass:[NSString class]] &&
-            ![obj isKindOfClass:[NSDictionary class]] &&
-            ![obj isKindOfClass:[NSArray class]] &&
-            ![obj isKindOfClass:[NSNumber class]]) {
-            /* 自定义对象（Swift/KMP model）：只打类名，description 可能是垃圾或副作用 */
-            return [NSString stringWithFormat:@"<obj class=%@>", cn ?: @"?"];
-        }
-        NSString *d = [obj description];
-        if (!d) return [NSString stringWithFormat:@"<nil desc class=%@>", cn ?: @"?"];
-        return d.length > 3000 ? [[d substringToIndex:3000] stringByAppendingString:@" ...(trunc)"] : d;
-    } @catch (NSException *e) {
-        return [NSString stringWithFormat:@"<desc threw:%@>", e.name];
-    }
-}
-
-static BOOL DYGate(NSString *key) {
-    if (gDumpCount >= DY_LIMIT) return NO;
-    if (!key) return NO;
-    @try {
-        if ([gSeenHits containsObject:key]) return NO;
-        [gSeenHits addObject:key];
-    } @catch (...) { return YES; }
-    gDumpCount++;
-    return YES;
-}
-
-static UIViewController *DYTopVC(void) {
-    @try {
-        UIWindow *win = nil;
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in ((UIWindowScene *)scene).windows) if (w.isKeyWindow) { win = w; break; }
-            }
-        }
-        if (!win) win = [UIApplication sharedApplication].keyWindow;
-        UIViewController *vc = win.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
-        return vc;
-    } @catch (...) { return nil; }
-}
-
-/* ---------- 找原始 IMP ---------- */
-static IMP DYOrigFor(id self, SEL _cmd) {
-    NSString *sel = NSStringFromSelector(_cmd);
-    BOOL isMeta = class_isMetaClass(object_getClass(self));
-    Class c = isMeta ? object_getClass(self) : [self class];
-    while (c) {
-        NSString *cn = NSStringFromClass(c);
-        NSString *k1 = [NSString stringWithFormat:@"%@|%@", cn, sel];
-        NSString *k2 = [NSString stringWithFormat:@"%@%@|%@", isMeta ? @"+" : @"-", cn, sel];
-        IMP o = [gOrigByHook[k2] pointerValue];
-        if (!o) o = [gOrigByHook[k1] pointerValue];
-        if (o) return o;
-        c = class_getSuperclass(c);
-    }
-    IMP o2 = [gOrigBySel[sel] pointerValue];
-    return o2 ?: NULL;
-}
-
-/* ---------- ABI 校验：业务参数必须全是对象 ---------- */
-static int DYObjectArgCount(const char *enc) {
-    if (!enc) return -1;
-    const char *colon = strchr(enc, ':');
-    if (!colon) return -1;
-    int cnt = 0;
-    BOOL inQuote = NO;
-    for (const char *p = colon + 1; *p; p++) {
-        if (*p == '"') { inQuote = !inQuote; continue; }
-        if (inQuote) continue;
-        if (*p >= '0' && *p <= '9') continue;
-        if (*p == ':') continue;
-        if (*p == '@') { cnt++; continue; }
-        return -1;   /* 标量/结构体 -> 放弃 hook */
-    }
-    return cnt;
-}
-
-/* ---------- 只读 trampoline：记录 + 原样转发，绝不改对象 ---------- */
-#define DY_LOG_AND_CALL(idname, voidname, n) \
-static id idname(id self, SEL _cmd, id a1,id a2,id a3,id a4,id a5,id a6) { \
-    return DYROCore(self, _cmd, n, NO, a1,a2,a3,a4,a5,a6); \
-} \
-static void voidname(id self, SEL _cmd, id a1,id a2,id a3,id a4,id a5,id a6) { \
-    DYROCore(self, _cmd, n, YES, a1,a2,a3,a4,a5,a6); \
-}
-
-/* 统一核心：n = 业务参数个数；wantVoid = 原方法是否返回 void。
- * 用同一个 C 函数按 n 分派调用原 IMP，避免多份宏拼接出错。 */
-static id DYROCore(id self, SEL _cmd, int n, BOOL wantVoid,
-                   id a1, id a2, id a3, id a4, id a5, id a6) {
-    NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    id p[6] = { a1, a2, a3, a4, a5, a6 };
-
-    /* 组参数摘要（只读 description） */
-    NSMutableString *args = [NSMutableString string];
-    for (int i = 0; i < n; i++) {
-        [args appendFormat:@" arg%d=%@", i + 1, DYSafeFull(p[i])];
-    }
-
-    IMP orig = DYOrigFor(self, _cmd);
-    id retObj = nil;
-    if (orig) {
-        @try {
-            if (wantVoid) {
-                if      (n==0) ((void(*)(id,SEL))orig)(self,_cmd);
-                else if (n==1) ((void(*)(id,SEL,id))orig)(self,_cmd,p[0]);
-                else if (n==2) ((void(*)(id,SEL,id,id))orig)(self,_cmd,p[0],p[1]);
-                else if (n==3) ((void(*)(id,SEL,id,id,id))orig)(self,_cmd,p[0],p[1],p[2]);
-                else if (n==4) ((void(*)(id,SEL,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3]);
-                else if (n==5) ((void(*)(id,SEL,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4]);
-                else if (n==6) ((void(*)(id,SEL,id,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4],p[5]);
-            } else {
-                if      (n==0) retObj = ((id(*)(id,SEL))orig)(self,_cmd);
-                else if (n==1) retObj = ((id(*)(id,SEL,id))orig)(self,_cmd,p[0]);
-                else if (n==2) retObj = ((id(*)(id,SEL,id,id))orig)(self,_cmd,p[0],p[1]);
-                else if (n==3) retObj = ((id(*)(id,SEL,id,id,id))orig)(self,_cmd,p[0],p[1],p[2]);
-                else if (n==4) retObj = ((id(*)(id,SEL,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3]);
-                else if (n==5) retObj = ((id(*)(id,SEL,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4]);
-                else if (n==6) retObj = ((id(*)(id,SEL,id,id,id,id,id,id))orig)(self,_cmd,p[0],p[1],p[2],p[3],p[4],p[5]);
-            }
-        } @catch (NSException *e) {
-            DYAppend([NSString stringWithFormat:@"[RO] orig 抛异常 %@ on %@", e.name, tag]);
-        }
-    }
-
-    NSString *dkey = [NSString stringWithFormat:@"ro%d|%@|%@", n, tag, [args substringToIndex:MIN((NSUInteger)80, args.length)]];
-    if (DYGate(dkey)) {
-        if (wantVoid) {
-            DYAppend([NSString stringWithFormat:@"[RO-v] %@%@", tag, args]);
-        } else {
-            DYAppend([NSString stringWithFormat:@"[RO-o] %@%@ ret=%@", tag, args, DYSafeFull(retObj)]);
-        }
-    }
-    return retObj;
-}
-
-/* 为 n=0..6 生成包装函数（名字由宏拼接，唯一；引用见 DYTrampFor 集中数组） */
-DY_LOG_AND_CALL(dy_ro_id_0,  dy_ro_void_0,  0)
-DY_LOG_AND_CALL(dy_ro_id_1,  dy_ro_void_1,  1)
-DY_LOG_AND_CALL(dy_ro_id_2,  dy_ro_void_2,  2)
-DY_LOG_AND_CALL(dy_ro_id_3,  dy_ro_void_3,  3)
-DY_LOG_AND_CALL(dy_ro_id_4,  dy_ro_void_4,  4)
-DY_LOG_AND_CALL(dy_ro_id_5,  dy_ro_void_5,  5)
-DY_LOG_AND_CALL(dy_ro_id_6,  dy_ro_void_6,  6)
-
-/* addCommentParams 专用：真实签名 @@:q@@@@（首业务参数 64 位标量 q） */
-static id dy_ro_addCommentParams(id self, SEL _cmd, long long p1, id o2, id o3, id o4, id o5) {
-    NSString *tag = [NSString stringWithFormat:@"%@|%@", NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    IMP orig = DYOrigFor(self, _cmd);
-    id r = nil;
-    if (orig) { @try { r = ((id(*)(id,SEL,long long,id,id,id,id))orig)(self,_cmd,p1,o2,o3,o4,o5); } @catch (...) {} }
-    if (DYGate([@"ro-add|" stringByAppendingString:tag])) {
-        DYAppend([NSString stringWithFormat:@"[RO-ADDPARAMS] %@ p1=%lld o2=%@ o3=%@ o4=%@ o5=%@ ret=%@",
-                  tag, p1, DYSafeFull(o2), DYSafeFull(o3), DYSafeFull(o4), DYSafeFull(o5), DYSafeFull(r)]);
-    }
-    return r;
-}
-
-/* 集中引用所有 trampoline，便于核对定义-引用一致 */
-static IMP DYTrampFor(int n, BOOL retVoid) {
-    if (n < 0 || n > 6) return NULL;
-    if (retVoid) {
-        IMP t[7] = { (IMP)dy_ro_void_0, (IMP)dy_ro_void_1, (IMP)dy_ro_void_2, (IMP)dy_ro_void_3,
-                     (IMP)dy_ro_void_4, (IMP)dy_ro_void_5, (IMP)dy_ro_void_6 };
-        return t[n];
-    }
-    IMP t[7] = { (IMP)dy_ro_id_0, (IMP)dy_ro_id_1, (IMP)dy_ro_id_2, (IMP)dy_ro_id_3,
-                 (IMP)dy_ro_id_4, (IMP)dy_ro_id_5, (IMP)dy_ro_id_6 };
-    return t[n];
-}
-
-/* ---------- 命中关键词筛选 ---------- */
-static BOOL DYInterestingSEL(NSString *sn) {
-    if (!sn) return NO;
-    NSString *s = [sn lowercaseString];
-    NSArray *kw = @[
-        @"comment", @"publish", @"textextra", @"text_extra",
-        @"requestparams", @"requestmodel", @"commonrequestforpost",
-        @"buildrequestparams", @"datawithrequestmodel", @"bodyp",
-        @"setbody", @"extraparams", @"penetrate", @"inputsnapshot"
-    ];
-    for (NSString *k in kw) if ([s rangeOfString:k].location != NSNotFound) return YES;
-    return NO;
-}
-
-static IMP DYPickTrampoline(SEL sel, const char *enc) {
-    if (!enc) return NULL;
-    NSString *sn = NSStringFromSelector(sel);
-    /* addCommentParams 专用签名优先 */
-    if ([sn isEqualToString:@"addCommentParams:generalModel:commentModel:textExtras:params:"]) {
-        /* 允许 @@:q@@@@ (DYSigOf 后) */
-        NSMutableString *sig = [NSMutableString string];
-        for (const char *q = enc; *q; q++) {
-            if (*q >= '0' && *q <= '9') continue;
-            [sig appendFormat:@"%c", *q];
-        }
-        if ([sig isEqualToString:@"@@:q@@@@"]) return (IMP)dy_ro_addCommentParams;
-        DYAppend([NSString stringWithFormat:@"[PICK] addCommentParams 签名非预期 %@ 放弃", sig]);
-        return NULL;
-    }
-    char ret = enc[0];
-    BOOL retVoid = (ret == 'v');
-    BOOL retObj  = (ret == '@');
-    if (!retVoid && !retObj) return NULL;
-    int objArgs = DYObjectArgCount(enc);
-    if (objArgs < 0) return NULL;
-    NSUInteger colonCount = [[sn componentsSeparatedByString:@":"] count] - 1;
-    if (objArgs != (int)colonCount) return NULL;   /* 双保险 */
-    if (colonCount == 0 && !retObj) return NULL;    /* 0 参数 void 无意义 */
-    return DYTrampFor((int)colonCount, retVoid);
-}
-
-/* ---------- 扫描安装 ---------- */
-static int DYScanList(Method *ml, unsigned int mc, NSString *clsName, BOOL isClassMethod) {
-    int hit = 0;
-    @try {
-        for (unsigned int j = 0; j < mc; j++) {
-            SEL sel = method_getName(ml[j]);
-            NSString *sn = NSStringFromSelector(sel);
-            if (!DYInterestingSEL(sn)) continue;
-            NSString *key = [NSString stringWithFormat:@"%@%@|%@", isClassMethod ? @"+" : @"-", clsName, sn];
-            if ([gHookedKeys containsObject:key]) continue;
-            const char *enc = method_getTypeEncoding(ml[j]);
-            IMP tramp = DYPickTrampoline(sel, enc);
-            if (!tramp) continue;
-            IMP orig = method_setImplementation(ml[j], tramp);
-            if (orig) {
-                gOrigByHook[key] = [NSValue valueWithPointer:orig];
-                gOrigBySel[sn] = [NSValue valueWithPointer:orig];
-                [gHookedKeys addObject:key];
-                hit++;
-            }
-        }
-    } @catch (NSException *e) {
-        DYAppend([NSString stringWithFormat:@"[SCAN] 异常 %@", e.name]);
-    }
-    return hit;
-}
-
-static void DYHookAll(void) {
-    unsigned int cc = 0;
-    Class *classes = objc_copyClassList(&cc);
-    int total = 0;
-    @try {
-        for (unsigned int i = 0; i < cc; i++) {
-            Class cls = classes[i];
-            NSString *cn = NSStringFromClass(cls);
-            unsigned int mc = 0;
-            Method *ml = class_copyMethodList(cls, &mc);
-            if (ml) { total += DYScanList(ml, mc, cn, NO); free(ml); }
-            Class meta = object_getClass(cls);
-            if (meta) {
-                unsigned int cmc = 0;
-                Method *cml = class_copyMethodList(meta, &cmc);
-                if (cml) { total += DYScanList(cml, cmc, cn, YES); free(cml); }
-            }
-        }
-    } @catch (NSException *e) {
-        DYAppend([NSString stringWithFormat:@"[HOOK] 全类扫描异常 %@", e.name]);
-    }
-    free(classes);
-    DYAppend([NSString stringWithFormat:@"[HOOK] 只读探针共挂 %d 个方法", total]);
-}
-
-static void DYCopyLog(void) {
-    @try {
-        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (!doc) return;
         NSString *path = [doc stringByAppendingPathComponent:@"dyprobe_dump.txt"];
-        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-        UIPasteboard *pb = [UIPasteboard generalPasteboard];
-        if (pb) pb.string = (txt ?: gBuf ?: @"");
+        NSString *line = [NSString stringWithFormat:@"[v14] %@\n", msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+        else { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
     } @catch (...) {}
 }
 
-static void DYBootAlert(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIViewController *vc = DYTopVC();
-        if (!vc) return;
-        @try {
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v13 只读诊断"
-                message:@"本版只读、不改任何对象，不会再闪退。\n发一条普通评论，然后把 Documents/dyprobe_dump.txt 给我。\n目的：抓清真实 body 结构与 hook 点（这次评论不会变红）。"
-                preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ DYCopyLog(); }]];
-            [ac addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleCancel handler:nil]];
-            [vc presentViewController:ac animated:YES completion:nil];
-        } @catch (...) {}
-    });
+/* ============================ 三个 hook 点 ============================ */
+
+/* --- A. SSL_CTX_set_custom_verify ---
+ * BoringSSL 原型：
+ *   void SSL_CTX_set_custom_verify(SSL_CTX *ctx, int mode,
+ *        enum ssl_verify_result_t (*callback)(SSL *ssl, uint8_t *out_alert));
+ * ssl_verify_result_t: ssl_verify_ok = 0
+ * 做法：无视业务传入的回调，一律换成"永远返回 0"。
+ */
+typedef int (*DYVerifyCb)(void *ssl, uint8_t *out_alert);
+static void (*orig_SSL_CTX_set_custom_verify)(void *ctx, int mode, DYVerifyCb cb);
+
+static int dy_always_ok_cb(void *ssl, uint8_t *out_alert) {
+    (void)ssl; (void)out_alert;
+    return 0;   /* ssl_verify_ok */
 }
 
+static void dy_SSL_CTX_set_custom_verify(void *ctx, int mode, DYVerifyCb cb) {
+    (void)cb;
+    if (orig_SSL_CTX_set_custom_verify) {
+        orig_SSL_CTX_set_custom_verify(ctx, mode, dy_always_ok_cb);
+    }
+}
+
+/* --- A2. SSL_set_custom_verify（per-SSL 版本，TTNet 也可能用这个） --- */
+static void (*orig_SSL_set_custom_verify)(void *ssl, int mode, DYVerifyCb cb);
+static void dy_SSL_set_custom_verify(void *ssl, int mode, DYVerifyCb cb) {
+    (void)cb;
+    if (orig_SSL_set_custom_verify) {
+        orig_SSL_set_custom_verify(ssl, mode, dy_always_ok_cb);
+    }
+}
+
+/* --- B. X509_verify_cert ---
+ * int X509_verify_cert(X509_STORE_CTX *ctx);  返回 1 = 校验通过
+ */
+static int (*orig_X509_verify_cert)(void *ctx);
+static int dy_X509_verify_cert(void *ctx) {
+    (void)ctx;
+    return 1;
+}
+
+/* --- C. SSL_get_verify_result ---
+ * long SSL_get_verify_result(const SSL *ssl);  返回 0 = X509_V_OK
+ */
+static long (*orig_SSL_get_verify_result)(void *ssl);
+static long dy_SSL_get_verify_result(void *ssl) {
+    (void)ssl;
+    return 0;
+}
+
+/* ============================ 安装 ============================ */
 __attribute__((constructor)) static void DYInit(void) {
     @autoreleasepool {
-        gBuf = [NSMutableString string];
-        gOrigByHook = [NSMutableDictionary dictionary];
-        gOrigBySel = [NSMutableDictionary dictionary];
-        gHookedKeys = [NSMutableSet set];
-        gSeenHits = [NSMutableSet set];
-        DYAppend(@"DYProbe v13 init (纯只读诊断探针 type=21 参考; 零注入/零KVC/零返回值修改)");
+        struct rebinding rb[] = {
+            { "SSL_CTX_set_custom_verify", (void *)dy_SSL_CTX_set_custom_verify,
+              (void **)&orig_SSL_CTX_set_custom_verify },
+            { "SSL_set_custom_verify", (void *)dy_SSL_set_custom_verify,
+              (void **)&orig_SSL_set_custom_verify },
+            { "X509_verify_cert", (void *)dy_X509_verify_cert,
+              (void **)&orig_X509_verify_cert },
+            { "SSL_get_verify_result", (void *)dy_SSL_get_verify_result,
+              (void **)&orig_SSL_get_verify_result },
+        };
+        int rc = dy_rebind_symbols(rb, sizeof(rb) / sizeof(rb[0]));
+        DYLog([NSString stringWithFormat:@"init rc=%d (0=成功注册)", rc]);
+
+        /* 稍后回报实际是否 rebind 到（orig 非空 = 已接管） */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            DYLog([NSString stringWithFormat:@"接管状态 ctx_custom=%@ ssl_custom=%@ x509=%@ verify_result=%@",
+                   orig_SSL_CTX_set_custom_verify ? @"YES" : @"NO",
+                   orig_SSL_set_custom_verify ? @"YES" : @"NO",
+                   orig_X509_verify_cert ? @"YES" : @"NO",
+                   orig_SSL_get_verify_result ? @"YES" : @"NO"]);
+        });
     }
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
-        object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
-            @autoreleasepool {
-                DYBootAlert();
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    @autoreleasepool { DYHookAll(); }
-                });
-            }
-        }];
 }
