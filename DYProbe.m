@@ -46,6 +46,8 @@ static NSTimer *gPollTimer = nil;
 static IMP gOrigSetType = NULL;
 static int  gSetTypeKind = 0;   /* 1=标量int  2=NSNumber对象 */
 static NSInteger gSetTypeCalls = 0;
+static BOOL gHookWarned = NO;
+static BOOL gHookUnsupported = NO;
 
 static void DYAppend(NSString *line) {
     if (!gBuf) gBuf = [NSMutableString string];
@@ -90,6 +92,12 @@ static UIViewController *DYTopVC(void) {
 
 static void DYCopyToPasteboard(void) {
     @try { UIPasteboard *pb = [UIPasteboard generalPasteboard]; if (pb) pb.string = (gBuf ?: @""); } @catch (...) {}
+}
+
+/* 每次注入后把最新日志存盘并同步到剪贴板，用户直接粘贴即可回传 */
+static void DYFlushLog(void) {
+    DYSave();
+    dispatch_async(dispatch_get_main_queue(), ^{ DYCopyToPasteboard(); });
 }
 
 static void DYPop(void) {
@@ -143,7 +151,8 @@ static void dy_setType_int(id self, SEL _cmd, int v) {
         gSetTypeCalls++;
         gHit++;
         DYAppend([NSString stringWithFormat:@"[SET-TYPE #%ld] 原值=%d  ->  注入=%ld (当前轮询值) on %@",
-                  (long)gSetTypeCalls, v, (long)gCurrentType, NSStringFromClass([self class]))];
+                  (long)gSetTypeCalls, v, (long)gCurrentType, NSStringFromClass([self class])]);
+        DYFlushLog();
     } @catch (...) {}
     if (gOrigSetType && gOrigSetType != (IMP)dy_setType_int) {
         @try { ((void(*)(id,SEL,int))gOrigSetType)(self, _cmd, (int)gCurrentType); } @catch (...) {}
@@ -156,7 +165,8 @@ static void dy_setType_obj(id self, SEL _cmd, id v) {
         gSetTypeCalls++;
         gHit++;
         DYAppend([NSString stringWithFormat:@"[SET-TYPE #%ld] 原值=%@  ->  注入=%ld (当前轮询值) on %@",
-                  (long)gSetTypeCalls, DYSafe(v), (long)gCurrentType, NSStringFromClass([self class]))];
+                  (long)gSetTypeCalls, DYSafe(v), (long)gCurrentType, NSStringFromClass([self class])]);
+        DYFlushLog();
     } @catch (...) {}
     if (gOrigSetType && gOrigSetType != (IMP)dy_setType_obj) {
         @try { ((void(*)(id,SEL,id))gOrigSetType)(self, _cmd, @(gCurrentType)); } @catch (...) {}
@@ -192,12 +202,12 @@ static void dy_dump_1(id self, SEL _cmd, id arg) {
 #pragma mark - hook 安装
 
 static void DYInstallSetTypeHook(void) {
+    if (gOrigSetType || gHookUnsupported) return;
     @try {
         Class ec = objc_getClass("AWETextExtra");
-        if (!ec) { DYAppend(@"[HOOK] AWETextExtra 类未注册, 等下一轮"); return; }
+        if (!ec) { if (!gHookWarned) { DYAppend(@"[HOOK] AWETextExtra 类未注册, 等下一轮"); gHookWarned = YES; } return; }
         Method m = class_getInstanceMethod(ec, @selector(setType:));
-        if (!m) { DYAppend(@"[HOOK] AWETextExtra 无 setType:, 等下一轮"); return; }
-        if (gSetTypeCalls < 0) return;
+        if (!m) { if (!gHookWarned) { DYAppend(@"[HOOK] AWETextExtra 无 setType:, 等下一轮"); gHookWarned = YES; } return; }
         const char *enc = method_getTypeEncoding(m);
         DYAppend([NSString stringWithFormat:@"[HOOK] AWETextExtra setType: enc=%s", enc ? enc : "?"]);
         int kind = DYSetTypeArgKind(enc);
@@ -210,6 +220,7 @@ static void DYInstallSetTypeHook(void) {
             gSetTypeKind = 2;
             DYAppend(@"[HOOK] setType: 已挂钩 (NSNumber 对象)");
         } else {
+            gHookUnsupported = YES;
             DYAppend(@"[HOOK] setType: 参数种类未知, 跳过以防崩");
         }
     } @catch (NSException *e) {
@@ -267,6 +278,7 @@ static void DYStartPolling(void) {
                 gCurrentType++;
                 if (gCurrentType > DY_TYPE_TO) gCurrentType = DY_TYPE_FROM;
                 DYAppend([NSString stringWithFormat:@"[POLL] === 当前 type = %ld === (现在发的评论用这个值)", (long)gCurrentType]);
+                if (!gOrigSetType) DYInstallSetTypeHook();   /* 类晚注册时补挂钩 */
                 DYSave();
             }
         }];
@@ -284,8 +296,9 @@ static void DYBootAlert(void) {
         if (!vc) return;
         @try {
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"DYProbe v5 批量测试已加载"
-                message:[NSString stringWithFormat:@"type 每 2 秒自动 +1 (%d→%d)。\n\n发一条带 @ 或 # 的评论，间隔 2 秒发下一条。到网页端看哪条变色，再把本插件的 dyprobe_dump.txt 发回。", DY_TYPE_FROM, DY_TYPE_TO]
+                message:[NSString stringWithFormat:@"type 每 2 秒自动 +1 (%d→%d)。\n\n发一条带 @ 或 # 的评论，间隔 2 秒发下一条。每条发出后日志自动复制到剪贴板；测试完点下方按钮再复制一次，粘贴发回即可。", DY_TYPE_FROM, DY_TYPE_TO]
                 preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ DYCopyToPasteboard(); }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"开始测试" style:UIAlertActionStyleCancel handler:nil]];
             [vc presentViewController:ac animated:YES completion:nil];
         } @catch (...) {}
