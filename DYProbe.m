@@ -1,6 +1,5 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
 #import <dlfcn.h>
 #import <string.h>
 #import <stdlib.h>
@@ -12,257 +11,265 @@
 #import <mach-o/nlist.h>
 
 /*
- * DYProbe v14 — BoringSSL Pinning Bypass（只做一件事：让 Charles 能看到抖音明文）
+ * DYProbe v15 — 在 SSL_write 抄明文（只读，不改一个字节）
  * ============================================================================
- * 为什么这一版不会闪退（设计原则：失败也不崩）：
- *   1) 不 hook 任何 ObjC 方法、不扫类、不碰任何业务对象。
- *   2) 只用 fishhook 改 boringssl 外部符号的 GOT 指针（纯数据指针替换）。
- *   3) 每个替换函数都判空后转发；hook 不到就什么都不做，App 照常跑。
+ * 为什么是这里（静态分析已确认）：
+ *   - boringssl.framework 只导出 SSL_write / SSL_read，没有 _ex 版本
+ *   - AwemeCore 只导入 SSL_write，没有 SSL_write_ex
+ *   - 不存在独立 QUIC 库 → 抖音 TLS 流量必经 SSL_write
+ *   - Charles 抓不到 amemv.com（TTNet 不走系统代理），Pinning 也挡；
+ *     但 SSL_write 是加密前明文，两者都绕过了
  *
- * 技术依据（砸壳包静态分析，已确认）：
- *   - AwemeCore 通过 LC_LOAD_DYLIB 链接 @rpath/boringssl.framework/boringssl
- *   - SSL_write / X509_verify_cert / SSL_CTX_set_custom_verify 等 9 个符号
- *     在 AwemeCore 中均为 N_UNDF（外部导入），可被 fishhook 重绑
- *   - 网络栈是 TTNet(855) + Cronet(200)，TLS 由 BoringSSL 承担
+ * 与 v13/v14 的区别（针对两次启动闪退的教训）：
+ *   - v13 崩：全类扫描 hook 几百个方法，ABI 靠猜
+ *   - v14 崩：在 constructor 里立刻改 GOT，此时 dyld 的 chained fixups 尚未全部应用
+ *   - v15：延迟 4 秒（启动完成、fixups 全部落地）后才动手；只改 1 个符号；
+ *          只读 buffer，绝不改内容、绝不改返回值、绝不 hook 业务对象
  *
- * hook 三个点（三重保险）：
- *   A. SSL_CTX_set_custom_verify：把业务传入的校验回调替换为"永远 OK"
- *      （字节 Pinning 的标准实现方式就是 custom_verify 回调）
- *   B. X509_verify_cert：直接返回 1（证书链校验通过）
- *   C. SSL_get_verify_result：返回 0（X509_V_OK）
+ * 只做三件事：
+ *   1) dlsym 先拿到 boringssl 里 SSL_write 的真实地址（orig）
+ *   2) 把各 image 里的 SSL_write GOT 指针指向本文件的 dy_SSL_write
+ *   3) dy_SSL_write 里检查 buffer，命中评论关键词就抄到 dyprobe_dump.txt，然后原样调用 orig
  *
- * 用法：装上 -> 打开抖音 -> Charles 里刷评论区/发评论 -> 看 amemv.com 是否变明文。
- *       本版不发红字，只负责"让抓包能看见"。
+ * 失败模式：hook 不上 = 什么都不发生，App 照常跑。日志里会有明确状态行。
  */
 
-/* ============================ fishhook（内联） ============================ */
-/* 基于 Facebook fishhook (BSD)。补了 iOS 13+ __DATA_CONST 段的 vm_protect，
- * 否则向只读段写指针会 EXC_BAD_ACCESS —— 这正是很多 fishhook 版本闪退的根因。 */
+/* ============================ 类型别名 ============================ */
+/* Apple SDK 里这些只是 struct 标签，没有同名 typedef，直接当类型名用会编译报错 */
+typedef struct mach_header_64     dy_mach_header_t;
+typedef struct segment_command_64 dy_segment_command_t;
+typedef struct section_64         dy_section_t;
+typedef struct nlist_64           dy_nlist_t;
 
-struct rebinding {
-    const char *name;
-    void *replacement;
-    void **replaced;
-};
-
-struct rebindings_entry {
-    struct rebinding *rebindings;
-    size_t rebindings_nel;
-    struct rebindings_entry *next;
-};
-
-static struct rebindings_entry *_rebindings_head;
-
-/* Apple SDK 中 mach_header_64 / segment_command_64 / section_64 / nlist_64
- * 都是 struct 标签，没有同名 typedef。必须自建别名，否则编译直接报错。 */
-typedef struct mach_header_64     mach_header_t;
-typedef struct segment_command_64 segment_command_t;
-typedef struct section_64         section_t;
-typedef struct nlist_64           nlist_t;
-
-static int dy_prepend_rebindings(struct rebindings_entry **head,
-                                 struct rebinding rebindings[], size_t nel) {
-    struct rebindings_entry *e = (struct rebindings_entry *)malloc(sizeof(struct rebindings_entry));
-    if (!e) return -1;
-    e->rebindings = (struct rebinding *)malloc(sizeof(struct rebinding) * nel);
-    if (!e->rebindings) { free(e); return -1; }
-    memcpy(e->rebindings, rebindings, sizeof(struct rebinding) * nel);
-    e->rebindings_nel = nel;
-    e->next = *head;
-    *head = e;
-    return 0;
+/* ============================ 日志 ============================ */
+static NSString *DYLogPath(void) {
+    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!doc) return nil;
+    return [doc stringByAppendingPathComponent:@"dyprobe_dump.txt"];
 }
 
-static void dy_rebind_section(struct rebindings_entry *rebindings,
-                              section_t *section, intptr_t slide,
-                              nlist_t *symtab, char *strtab,
-                              uint32_t *indirect_symtab) {
-    uint32_t *indices = indirect_symtab + section->reserved1;
-    void **bindings = (void **)((uintptr_t)slide + section->addr);
+static void DYWrite(NSString *s) {
+    if (!s) return;
+    NSLog(@"[DYSW15] %@", s);
+    @try {
+        NSString *p = DYLogPath();
+        if (!p) return;
+        NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+        if (!d) return;
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (!fh) {
+            [d writeToFile:p atomically:YES];
+        } else {
+            @try { [fh seekToEndOfFile]; [fh writeData:d]; }
+            @finally { [fh closeFile]; }
+        }
+    } @catch (...) {}
+}
 
-    /* 关键：__DATA_CONST 是只读段，必须临时加写权限，否则写指针直接崩。
-     * 加权限失败（chained fixups / 权限策略收紧）就整段跳过——宁可 hook 不生效，也绝不崩。 */
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)bindings, section->size,
+/* ============================ 小工具 ============================ */
+static const void *dy_memmem(const void *h, size_t hl, const void *n, size_t nl) {
+    if (!h || !n || nl == 0 || hl < nl) return NULL;
+    const unsigned char *p = (const unsigned char *)h;
+    const unsigned char *last = p + (hl - nl);
+    unsigned char first = *(const unsigned char *)n;
+    while (p <= last) {
+        if (*p == first && memcmp(p, n, nl) == 0) return p;
+        p++;
+    }
+    return NULL;
+}
+
+/* 把 buffer 转成可读文本：可打印字符保留，换行保留，其余转 '.' */
+static void DYDumpBuf(const char *tag, const void *buf, int len) {
+    if (!buf || len <= 0) return;
+    int n = len > 4096 ? 4096 : len;   /* 单次最多抄 4KB，防止文件爆掉 */
+    const unsigned char *p = (const unsigned char *)buf;
+    NSMutableString *ms = [NSMutableString stringWithCapacity:(NSUInteger)n + 128];
+    for (int i = 0; i < n; i++) {
+        unsigned char c = p[i];
+        if (c == '\n')      [ms appendString:@"\n"];
+        else if (c == '\r') [ms appendString:@"\\r"];
+        else if (c == '\t') [ms appendString:@"\\t"];
+        else if (c >= 32 && c < 127) [ms appendFormat:@"%c", c];
+        else                [ms appendString:@"."];
+    }
+    NSString *head = [NSString stringWithFormat:
+                      @"\n===== %@ len=%d%s =====\n", tag, len, (len > n ? " (截断到4096)" : "")];
+    DYWrite([head stringByAppendingString:
+             [NSString stringWithFormat:@"%@\n===== END %@ =====", ms, tag]]);
+}
+
+/* ============================ 核心：SSL_write ============================ */
+typedef int (*dy_ssl_write_t)(void *ssl, const void *buf, int num);
+static dy_ssl_write_t orig_SSL_write = NULL;
+
+static int g_dumpCount = 0;
+static const int kDumpLimit = 40;      /* 总共最多抄 40 段，够定位了 */
+
+/* 命中判定：评论发布请求的特征 */
+static BOOL dy_isCommentPublish(const void *buf, int len) {
+    if (!buf || len <= 0) return NO;
+    size_t n = (size_t)len;
+    if (dy_memmem(buf, n, "comment/publish", 15)) return YES;   /* HTTP/1.1 请求行 */
+    if (dy_memmem(buf, n, "/aweme/v1/comment", 17)) return YES; /* 路径片段 */
+    /* HTTP/2 下请求行被 HPACK 压缩搜不到，但 body 里 text= 是明文 */
+    if (dy_memmem(buf, n, "text=", 5) && dy_memmem(buf, n, "aweme_id", 8)) return YES;
+    return NO;
+}
+
+static int dy_SSL_write(void *ssl, const void *buf, int num) {
+    @autoreleasepool {
+        if (buf && num > 0 && g_dumpCount < kDumpLimit) {
+            @try {
+                if (dy_isCommentPublish(buf, num)) {
+                    g_dumpCount++;
+                    DYDumpBuf([NSString stringWithFormat:@"SSL_write#%d", g_dumpCount], buf, num);
+                }
+            } @catch (...) {}
+        }
+    }
+    if (orig_SSL_write) return orig_SSL_write(ssl, buf, num);
+    return -1;
+}
+
+/* ============================ fishhook（精简：只改指定符号的 GOT） ============================ */
+struct dy_rebinding { const char *name; void *replacement; };
+
+static struct dy_rebinding g_rb[] = {
+    { "SSL_write", (void *)dy_SSL_write },
+};
+static const size_t g_rb_n = sizeof(g_rb) / sizeof(g_rb[0]);
+static int g_replaced = 0;
+
+static BOOL dy_name_match(const char *symname) {
+    if (!symname || !symname[0] || !symname[1]) return NO;
+    const char *shortname = symname + 1;   /* 跳过前导 '_' */
+    for (size_t i = 0; i < g_rb_n; i++) {
+        if (strcmp(shortname, g_rb[i].name) == 0) return YES;
+    }
+    return NO;
+}
+
+static void dy_rebind_section(dy_section_t *sect, intptr_t slide,
+                              dy_nlist_t *symtab, char *strtab, uint32_t *indirect) {
+    if ((sect->flags & SECTION_TYPE) != S_NON_LAZY_SYMBOL_POINTERS &&
+        (sect->flags & SECTION_TYPE) != S_LAZY_SYMBOL_POINTERS) return;
+
+    size_t cnt = sect->size / sizeof(void *);
+    if (cnt == 0) return;
+    void **bindings = (void **)((uintptr_t)slide + sect->addr);
+    uint32_t *indices = indirect + sect->reserved1;
+
+    /* 先探一遍：这段里到底有没有我们的目标符号。没有就不碰权限，尽量少动内存 */
+    BOOL hit = NO;
+    for (size_t k = 0; k < cnt; k++) {
+        uint32_t si = indices[k];
+        if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL ||
+            si == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
+        if (dy_name_match(strtab + symtab[si].n_un.n_strx)) { hit = YES; break; }
+    }
+    if (!hit) return;
+
+    /* __DATA_CONST 是只读段，必须按页对齐后临时加写权限 */
+    uintptr_t ps = (uintptr_t)vm_page_size;
+    uintptr_t s = (uintptr_t)bindings & ~(ps - 1);
+    uintptr_t e = ((uintptr_t)bindings + sect->size + ps - 1) & ~(ps - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)s, (vm_size_t)(e - s),
                                   0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) return;
+    if (kr != KERN_SUCCESS) return;   /* 加不上权限就整段放弃，绝不硬写 */
 
-    for (uint32_t i = 0; i < section->size / sizeof(void *); i++) {
-        uint32_t symidx = indices[i];
-        if (symidx == INDIRECT_SYMBOL_ABS || symidx == INDIRECT_SYMBOL_LOCAL ||
-            symidx == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
-
-        uint32_t strx = symtab[symidx].n_un.n_strx;
-        char *symname = strtab + strx;
-        if (!symname[0] || !symname[1]) continue;   /* 需跳过前导 '_' */
-
-        for (struct rebindings_entry *cur = rebindings; cur; cur = cur->next) {
-            for (size_t j = 0; j < cur->rebindings_nel; j++) {
-                if (strcmp(&symname[1], cur->rebindings[j].name) == 0) {
-                    if (cur->rebindings[j].replaced != NULL &&
-                        bindings[i] != cur->rebindings[j].replacement) {
-                        *(cur->rebindings[j].replaced) = bindings[i];
-                    }
-                    bindings[i] = cur->rebindings[j].replacement;
+    for (size_t k = 0; k < cnt; k++) {
+        uint32_t si = indices[k];
+        if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL ||
+            si == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
+        if (!dy_name_match(strtab + symtab[si].n_un.n_strx)) continue;
+        for (size_t r = 0; r < g_rb_n; r++) {
+            if (strcmp(strtab + symtab[si].n_un.n_strx + 1, g_rb[r].name) == 0) {
+                if (bindings[k] != g_rb[r].replacement) {
+                    bindings[k] = g_rb[r].replacement;
+                    g_replaced++;
                 }
             }
         }
     }
 }
 
-static void dy_rebind_image(struct rebindings_entry *rebindings,
-                            const struct mach_header *header, intptr_t slide) {
-    if (!rebindings) return;
-    Dl_info info;
-    if (dladdr(header, &info) == 0) return;
+static void dy_rebind_image(const struct mach_header *header, intptr_t slide) {
+    const dy_mach_header_t *mh = (const dy_mach_header_t *)header;
+    if (!mh || mh->magic != MH_MAGIC_64) return;
 
-    const mach_header_t *mh = (const mach_header_t *)header;
-    segment_command_t *cur_seg = NULL;
-    segment_command_t *linkedit = NULL;
-    struct symtab_command *symtab_cmd = NULL;
-    struct dysymtab_command *dysymtab_cmd = NULL;
+    dy_segment_command_t *linkedit = NULL;
+    struct symtab_command *stcmd = NULL;
+    struct dysymtab_command *dstcmd = NULL;
 
-    uintptr_t cur = (uintptr_t)header + sizeof(mach_header_t);
-    for (uint32_t i = 0; i < mh->ncmds; i++, cur += cur_seg->cmdsize) {
-        cur_seg = (segment_command_t *)cur;
-        if (cur_seg->cmd == LC_SEGMENT_64) {
-            if (strcmp(cur_seg->segname, SEG_LINKEDIT) == 0) linkedit = cur_seg;
-        } else if (cur_seg->cmd == LC_SYMTAB) {
-            symtab_cmd = (struct symtab_command *)cur_seg;
-        } else if (cur_seg->cmd == LC_DYSYMTAB) {
-            dysymtab_cmd = (struct dysymtab_command *)cur_seg;
-        }
+    uintptr_t cur = (uintptr_t)header + sizeof(dy_mach_header_t);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        dy_segment_command_t *seg = (dy_segment_command_t *)cur;
+        if (seg->cmdsize == 0) break;
+        if (seg->cmd == LC_SEGMENT_64 && strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit = seg;
+        else if (seg->cmd == LC_SYMTAB)   stcmd  = (struct symtab_command *)seg;
+        else if (seg->cmd == LC_DYSYMTAB) dstcmd = (struct dysymtab_command *)seg;
+        cur += seg->cmdsize;
     }
-    if (!symtab_cmd || !dysymtab_cmd || !linkedit ||
-        !dysymtab_cmd->nindirectsyms) return;
+    if (!linkedit || !stcmd || !dstcmd || dstcmd->nindirectsyms == 0) return;
 
     uintptr_t base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
-    nlist_t *symtab = (nlist_t *)(base + symtab_cmd->symoff);
-    char *strtab = (char *)(base + symtab_cmd->stroff);
-    uint32_t *indirect = (uint32_t *)(base + dysymtab_cmd->indirectsymoff);
+    dy_nlist_t *symtab = (dy_nlist_t *)(base + stcmd->symoff);
+    char *strtab = (char *)(base + stcmd->stroff);
+    uint32_t *indirect = (uint32_t *)(base + dstcmd->indirectsymoff);
 
-    cur = (uintptr_t)header + sizeof(mach_header_t);
-    for (uint32_t i = 0; i < mh->ncmds; i++, cur += cur_seg->cmdsize) {
-        cur_seg = (segment_command_t *)cur;
-        if (cur_seg->cmd != LC_SEGMENT_64) continue;
-        if (strcmp(cur_seg->segname, SEG_DATA) != 0 &&
-            strcmp(cur_seg->segname, "__DATA_CONST") != 0) continue;
-        for (uint32_t j = 0; j < cur_seg->nsects; j++) {
-            section_t *sect = (section_t *)(cur + sizeof(segment_command_t)) + j;
-            if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS ||
-                (sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
-                dy_rebind_section(rebindings, sect, slide, symtab, strtab, indirect);
-            }
+    cur = (uintptr_t)header + sizeof(dy_mach_header_t);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        dy_segment_command_t *seg = (dy_segment_command_t *)cur;
+        if (seg->cmdsize == 0) break;
+        cur += seg->cmdsize;
+        if (seg->cmd != LC_SEGMENT_64) continue;
+        if (strcmp(seg->segname, SEG_DATA) != 0 && strcmp(seg->segname, "__DATA_CONST") != 0) continue;
+        dy_section_t *sect = (dy_section_t *)((uintptr_t)seg + sizeof(dy_segment_command_t));
+        for (uint32_t j = 0; j < seg->nsects; j++, sect++) {
+            dy_rebind_section(sect, slide, symtab, strtab, indirect);
         }
     }
 }
 
-static void dy_rebind_cb(const struct mach_header *header, intptr_t slide) {
-    dy_rebind_image(_rebindings_head, header, slide);
-}
-
-static int dy_rebind_symbols(struct rebinding rebindings[], size_t nel) {
-    if (dy_prepend_rebindings(&_rebindings_head, rebindings, nel) < 0) return -1;
-    if (!_rebindings_head->next) {
-        _dyld_register_func_for_add_image(dy_rebind_cb);
-    } else {
-        uint32_t c = _dyld_image_count();
-        for (uint32_t i = 0; i < c; i++) {
-            dy_rebind_image(_rebindings_head, _dyld_get_image_header(i),
-                            _dyld_get_image_vmaddr_slide(i));
-        }
+/* ============================ 安装（延迟执行） ============================ */
+static void dy_install(void) {
+    void *p = dlsym(RTLD_DEFAULT, "SSL_write");
+    if (!p) {
+        DYWrite(@"[v15] dlsym SSL_write = NULL（boringssl 未加载），放弃安装");
+        return;
     }
-    return 0;
-}
+    orig_SSL_write = (dy_ssl_write_t)p;
+    DYWrite([NSString stringWithFormat:@"[v15] dlsym SSL_write = %p", p]);
 
-/* ============================ 日志 ============================ */
-static void DYLog(NSString *msg) {
-    NSLog(@"[DYPROBE14] %@", msg);
-    @try {
-        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        if (!doc) return;
-        NSString *path = [doc stringByAppendingPathComponent:@"dyprobe_dump.txt"];
-        NSString *line = [NSString stringWithFormat:@"[v14] %@\n", msg];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
-        else { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
-    } @catch (...) {}
-}
-
-/* ============================ 三个 hook 点 ============================ */
-
-/* --- A. SSL_CTX_set_custom_verify ---
- * BoringSSL 原型：
- *   void SSL_CTX_set_custom_verify(SSL_CTX *ctx, int mode,
- *        enum ssl_verify_result_t (*callback)(SSL *ssl, uint8_t *out_alert));
- * ssl_verify_result_t: ssl_verify_ok = 0
- * 做法：无视业务传入的回调，一律换成"永远返回 0"。
- */
-typedef int (*DYVerifyCb)(void *ssl, uint8_t *out_alert);
-static void (*orig_SSL_CTX_set_custom_verify)(void *ctx, int mode, DYVerifyCb cb);
-
-static int dy_always_ok_cb(void *ssl, uint8_t *out_alert) {
-    (void)ssl; (void)out_alert;
-    return 0;   /* ssl_verify_ok */
-}
-
-static void dy_SSL_CTX_set_custom_verify(void *ctx, int mode, DYVerifyCb cb) {
-    (void)cb;
-    if (orig_SSL_CTX_set_custom_verify) {
-        orig_SSL_CTX_set_custom_verify(ctx, mode, dy_always_ok_cb);
+    uint32_t total = _dyld_image_count();
+    uint32_t scanned = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        /* 跳过系统库：只关心 App 自己的 image，减少无关内存操作 */
+        if (strncmp(nm, "/usr/lib/", 9) == 0) continue;
+        if (strncmp(nm, "/System/Library/", 16) == 0) continue;
+        if (strncmp(nm, "/System/Cryptexes/", 18) == 0) continue;
+        dy_rebind_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+        scanned++;
+    }
+    DYWrite([NSString stringWithFormat:@"[v15] 安装完成：扫描 %u/%u 个非系统 image，改写 GOT %d 处",
+             scanned, total, g_replaced]);
+    if (g_replaced == 0) {
+        DYWrite(@"[v15] 注意：改写 0 处 → hook 未生效（SSL_write 可能不在 LDYNSYM 指针段），抓不到数据但不影响 App");
     }
 }
 
-/* --- A2. SSL_set_custom_verify（per-SSL 版本，TTNet 也可能用这个） --- */
-static void (*orig_SSL_set_custom_verify)(void *ssl, int mode, DYVerifyCb cb);
-static void dy_SSL_set_custom_verify(void *ssl, int mode, DYVerifyCb cb) {
-    (void)cb;
-    if (orig_SSL_set_custom_verify) {
-        orig_SSL_set_custom_verify(ssl, mode, dy_always_ok_cb);
-    }
-}
-
-/* --- B. X509_verify_cert ---
- * int X509_verify_cert(X509_STORE_CTX *ctx);  返回 1 = 校验通过
- */
-static int (*orig_X509_verify_cert)(void *ctx);
-static int dy_X509_verify_cert(void *ctx) {
-    (void)ctx;
-    return 1;
-}
-
-/* --- C. SSL_get_verify_result ---
- * long SSL_get_verify_result(const SSL *ssl);  返回 0 = X509_V_OK
- */
-static long (*orig_SSL_get_verify_result)(void *ssl);
-static long dy_SSL_get_verify_result(void *ssl) {
-    (void)ssl;
-    return 0;
-}
-
-/* ============================ 安装 ============================ */
 __attribute__((constructor)) static void DYInit(void) {
-    @autoreleasepool {
-        struct rebinding rb[] = {
-            { "SSL_CTX_set_custom_verify", (void *)dy_SSL_CTX_set_custom_verify,
-              (void **)&orig_SSL_CTX_set_custom_verify },
-            { "SSL_set_custom_verify", (void *)dy_SSL_set_custom_verify,
-              (void **)&orig_SSL_set_custom_verify },
-            { "X509_verify_cert", (void *)dy_X509_verify_cert,
-              (void **)&orig_X509_verify_cert },
-            { "SSL_get_verify_result", (void *)dy_SSL_get_verify_result,
-              (void **)&orig_SSL_get_verify_result },
-        };
-        int rc = dy_rebind_symbols(rb, sizeof(rb) / sizeof(rb[0]));
-        DYLog([NSString stringWithFormat:@"init rc=%d (0=成功注册)", rc]);
-
-        /* 稍后回报实际是否 rebind 到（orig 非空 = 已接管） */
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            DYLog([NSString stringWithFormat:@"接管状态 ctx_custom=%@ ssl_custom=%@ x509=%@ verify_result=%@",
-                   orig_SSL_CTX_set_custom_verify ? @"YES" : @"NO",
-                   orig_SSL_set_custom_verify ? @"YES" : @"NO",
-                   orig_X509_verify_cert ? @"YES" : @"NO",
-                   orig_SSL_get_verify_result ? @"YES" : @"NO"]);
-        });
-    }
+    /* 关键：不在 constructor 里立刻动手。
+     * v14 就是在这里立刻改 GOT 崩的——此时 dyld 的 chained fixups 还没全部应用完。
+     * 延后 4 秒，等 App 启动完成、所有 image 的 fixup 落地后再改，安全得多。 */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            DYWrite(@"[v15] 启动完成，开始安装 SSL_write 探针");
+            @try { dy_install(); } @catch (...) { DYWrite(@"[v15] 安装异常，已忽略"); }
+        }
+    });
 }
