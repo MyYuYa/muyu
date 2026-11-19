@@ -11,29 +11,30 @@
 #import <mach-o/nlist.h>
 
 /*
- * DYProbe v17 —— 全量调用索引 + 命中单独成档（仍然只读，不改一个字节）
+ * DYProbe v18 —— 全量调用索引 + 命中单独成档 + 存活心跳（只读，不改一个字节）
  * ============================================================================
- * v16 实测结论（用户日志，2026-11-20 00:13，53 次 SSL_write）：
- *   hook 完全正常：安装 7 处，写入了 53 段，没有一次崩溃。
- *   但整段日志里 **没有一条 POST、没有 tt21、没有 text/text_extra/comment**。
- *   能读出来的请求全是这一类：
- *       GET /.../video/tos/...  Host: v5-whe.douyinvod.com
- *       Range: bytes=0-511999   X-ReqType: preload
- *       User-Agent: AVDML_...,homepage_hot,MDLTaskPreload,MDLGroup(Aweme)
- *   也就是说：这一次启动抖音只做了「首页信息流视频/音频预加载」，
- *   评论的发布请求根本没有发出去（评论没点发送，或点了但没发成功）。
- *   → 观测层已经通了，缺的是「那条请求」本身。
+ * v17 实测结论（用户日志，2026-11-20 00:23:26 会话，56 条记录）：
+ *   安装正常（7 处 GOT），记录正常，但整段只有 1.9 秒：
+ *       #1  +16ms   … #56 +1874ms   →  之后一条都没有
+ *   且依旧 0 条 POST、0 次 tt21、0 次 text_extra。
+ *   同一份日志顺带证明了两件事（这两条很关键，后面全靠它们）：
+ *     a) POST 的 body 是明文 —— #40/#41 是 16384B + 8291B 纯 JSON
+ *        （"fast"/"model_selector"/"nativeml"/"poi_shelf_preload_galileo"…），
+ *        说明大 body 会被完整抄下来，评论 body 也是这个待遇。
+ *     b) 请求头是 HPACK 压缩的 —— #1 帧头 00 0b 71 01 25（HEADERS/END_STREAM|
+ *        END_HEADERS|PRIORITY, sid=0x3b），payload 以 80/92/82 这些索引字节开头，
+ *        所以 :path 永远不可能是明文，别再指望搜 "comment/publish"。
  *
- * v17 只做三件事，都是为了下一次能稳稳接住那条请求：
- *   1) 每一次 SSL_write 都写一行索引（序号 / 相对毫秒 / 字节数 / 类型 / ASCII 预览），
- *      小包另附 24 字节十六进制 → 能看出 HTTP/2 帧头、能一眼看出有没有 POST。
- *   2) 命中关键词的段落单独写进 dyprobe_hit.txt（最多 32KB 全文），
- *      用户只需要把这一份发出来，不用再贴几万字。
- *   3) 日志改成「跨会话追加」：文件 < 3MB 就接着写，不覆盖。
- *      抖音被系统重启也不会把已经抓到的东西冲掉。
+ * v18 只补一个洞，但这个洞是致命的：**时间**。
+ *   v17 只有相对毫秒、没有存活证据，无法区分「没发评论」和「抖音那一刻就没了」。
+ *   → 每 10 秒打一行 `[v18] 存活 #n +XXs (HH:mm:ss) 调用 N 次 …`。
+ *     下次日志最后一行如果是 +60s、+70s，就说明进程一直活着，
+ *     那期间没有 POST 就是真的没发出去；如果停在 +2s，就是提前导出或被杀了。
+ *   另外把 HTTP/2 帧头解析出来写进索引行（[DATA/sid15/f01] 这种），
+ *   同一流上「先 HEADERS 后 DATA」＝ 一次带 body 的真正请求，更容易定位。
  *
- * 安装逻辑与 v15/v16 **逐字相同**（已实测不崩）：
- *   - 延迟 4 秒装；只改 __DATA 段的 la_symbol_ptr 指针
+ * 与 v15/v16/v17 相同的安全约束（这部分一行没动，是已经验证不崩的版本）：
+ *   - 延迟 4 秒安装；只改 __DATA 段的 la_symbol_ptr 指针
  *   - 不 vm_protect、不扫 ObjC 类、不碰业务对象、不改 buffer、不改返回值
  */
 
@@ -136,7 +137,7 @@ static void DYAppend(NSString *s) {
     @try {
         if (!g_dumpFull && g_dumpBytes + (long long)[s length] > kDumpFileCap + (512 * 1024)) {
             g_dumpFull = YES;
-            DYAppendLocked(g_fh, @"[v17] 索引已达上限，后续不再写索引", NO, YES);
+            DYAppendLocked(g_fh, @"[v18] 索引已达上限，后续不再写索引", NO, YES);
         }
         if (!g_dumpFull) DYAppendLocked(g_fh, s, NO, NO);
     } @catch (...) {
@@ -152,7 +153,7 @@ static void DYAppendHit(NSString *s) {
     @try {
         if (!g_hitFull && g_hitBytes > kHitFileCap) {
             g_hitFull = YES;
-            DYAppendLocked(g_hit, @"[v17] 命中档已达上限，后续不再写", YES, YES);
+            DYAppendLocked(g_hit, @"[v18] 命中档已达上限，后续不再写", YES, YES);
         }
         if (!g_hitFull) DYAppendLocked(g_hit, s, YES, YES);
     } @catch (...) {
@@ -218,8 +219,46 @@ static NSString *dy_hex(const unsigned char *p, int n, int maxBytes) {
     return ms;
 }
 
-/* 多行正文：可打印保留，\r 写成 \\r，其余转 '.'（与 v16 一致，便于肉眼比对） */
-static NSString *dy_text(const unsigned char *p, int n) {
+/*
+ * 解析 HTTP/2 帧头（9 字节：length3 + type1 + flags1 + streamid4）。
+ * 只认「这一笔写入正好从一个帧头开始」且长度自洽的情况，否则返回 nil。
+ * 有了它，索引行就能直接写出 HEADERS / DATA / WINDOW_UPDATE 和流号，
+ * 一眼能看出「同一流上先 HEADERS 后 DATA」= 一次真正的请求（含 body）。
+ */
+static NSString *dy_h2frame(const unsigned char *p, int n, const char **kindOut) {
+    if (!p || n < 9) return nil;
+    unsigned len = ((unsigned)p[0] << 16) | ((unsigned)p[1] << 8) | (unsigned)p[2];
+    unsigned typ = (unsigned)p[3];
+    unsigned flg = (unsigned)p[4];
+    unsigned sid = (((unsigned)(p[5] & 0x7f)) << 24) | ((unsigned)p[6] << 16) |
+                   ((unsigned)p[7] << 8) | (unsigned)p[8];
+    if (typ > 0x09) return nil;                 /* 只认标准帧型 */
+    if (len + 9 > (unsigned)n) return nil;      /* 必须是完整帧 */
+    /* 有流号的帧型，sid 不能是 0；0 号流只允许 SETTINGS/WINDOW_UPDATE/PING/GOAWAY/WUPD */
+    if (sid == 0 && (typ == 0x00 || typ == 0x01 || typ == 0x02 ||
+                     typ == 0x03 || typ == 0x05 || typ == 0x09)) return nil;
+
+    const char *name = "?";
+    switch (typ) {
+        case 0x00: name = "DATA";  break;
+        case 0x01: name = "HEADER"; break;
+        case 0x02: name = "PRIO";  break;
+        case 0x03: name = "RST";   break;
+        case 0x04: name = "WND";   break;
+        case 0x05: name = "PUSH";  break;
+        case 0x06: name = "PING";  break;
+        case 0x07: name = "GOAWAY"; break;
+        case 0x08: name = "WUPD";  break;
+        case 0x09: name = "CONT";  break;
+    }
+    if (kindOut) *kindOut = name;
+
+    NSMutableString *f = [NSMutableString stringWithCapacity:24];
+    [f appendFormat:@"%@/sid%u/f%02x", [NSString stringWithUTF8String:name], sid, flg];
+    return f;
+}
+
+/* 多行正文：可打印保留，\r 写成 \\r，其余转 '.'（与 v16 一致，便于肉眼比对） */static NSString *dy_text(const unsigned char *p, int n) {
     if (!p || n <= 0) return @"";
     NSMutableString *ms = [NSMutableString stringWithCapacity:(NSUInteger)n + 32];
     for (int i = 0; i < n; i++) {
@@ -301,9 +340,12 @@ static void dy_record(int idx, const void *buf, int len) {
     /* 硬闸：超过 20000 次调用后只留命中段，防止推流类流量把索引刷爆 */
     if (!hit && idx > kSummaryCap) return;
 
-    /* 每一行索引：序号 / 相对毫秒 / 长度 / 类型 / ASCII 预览 */
+    /* 每一行索引：序号 / 相对毫秒 / 长度 / 类型 / 帧信息 / ASCII 预览 */
+    NSString *frame = dy_h2frame(p, len, NULL);
+
     NSMutableString *s = [NSMutableString stringWithCapacity:256];
     [s appendFormat:@"#%d +%lldms %dB %s%@", idx, ms, len, tag, hit ? @"  ★HIT" : @""];
+    if (frame) [s appendFormat:@" [%@]", frame];
     [s appendFormat:@"\n    a=\"%@\"", dy_line(p, len, 150)];
     if (strcmp(tag, "BIN") == 0 || strcmp(tag, "H2PRE") == 0) {
         [s appendFormat:@"\n    h=\"%@\"", dy_hex(p, len, 24)];
@@ -350,7 +392,7 @@ static int dy_SSL_write(void *ssl, const void *buf, int num) {
 
     if (c == 1 || (c % 200) == 0) {
         DYAppend([NSString stringWithFormat:
-                  @"[v17] 心跳：调用 %d 次 / 累计 %lld 字节 / 命中 %d / POST %d",
+                  @"[v18] 心跳：调用 %d 次 / 累计 %lld 字节 / 命中 %d / POST %d",
                   c, (long long)g_bytes, g_hits, g_posts]);
     }
 
@@ -457,6 +499,49 @@ static void dy_rebind_image(const struct mach_header *header, intptr_t slide) {
     }
 }
 
+/* ============================ 存活心跳（时间维度） ============================ */
+/*
+ * v17 的日志只有「相对毫秒」，看不出进程到底活了多久。
+ * 2026-11-20 00:23 那次 56 条记录全在 +1.9 秒内就结束了，
+ * 无法区分「没发评论」和「抖音那一刻就没了」——这是 v18 要补的第一个洞。
+ * 改成每 10 秒一行，日志自己就能证明活到了第几秒。
+ */
+static dispatch_source_t g_timer = nil;
+static volatile int      g_tick  = 0;
+
+static void dy_timer_tick(void) {
+    int t = __sync_add_and_fetch(&g_tick, 1);
+    long long el = (long long)(CFAbsoluteTimeGetCurrent() - g_t0);
+    if (el < 0) el = 0;
+
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    [df setDateFormat:@"HH:mm:ss"];
+    NSString *ts = [df stringFromDate:[NSDate date]] ?: @"?";
+
+    NSString *line = [NSString stringWithFormat:
+                      @"[v18] 存活 #%d +%llds (%@) 调用 %d 次 / %lld 字节 / 命中 %d / POST %d%@",
+                      t, el, ts, g_calls, (long long)g_bytes, g_hits, g_posts,
+                      (g_hits > 0) ? @"  ← 有命中，导出 dyprobe_hit.txt" : @""];
+    DYAppend(line);
+}
+
+static void dy_start_timer(void) {
+    if (g_timer) return;
+    g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                     dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    if (!g_timer) return;
+    dispatch_source_set_timer(g_timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                              (uint64_t)(10.0 * NSEC_PER_SEC),
+                              (uint64_t)(1.0 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(g_timer, ^{
+        @autoreleasepool {
+            @try { dy_timer_tick(); } @catch (...) {}
+        }
+    });
+    dispatch_resume(g_timer);
+}
+
 /* ============================ 安装（延迟执行） ============================ */
 static void dy_install(void) {
     g_t0 = CFAbsoluteTimeGetCurrent();
@@ -467,17 +552,17 @@ static void dy_install(void) {
     NSString *ts = [df stringFromDate:[NSDate date]] ?: @"?";
 
     DYAppend([NSString stringWithFormat:
-              @"\n\n========== [v17] 会话开始 %@ ==========", ts]);
+              @"\n\n========== [v18] 会话开始 %@ ==========", ts]);
     DYAppendHit([NSString stringWithFormat:
-                 @"\n\n========== [v17] 会话开始 %@ ==========", ts]);
+                 @"\n\n========== [v18] 会话开始 %@ ==========", ts]);
 
     void *p = dlsym(RTLD_DEFAULT, "SSL_write");
     if (!p) {
-        DYAppend(@"[v17] dlsym SSL_write = NULL（boringssl 未加载），放弃安装");
+        DYAppend(@"[v18] dlsym SSL_write = NULL（boringssl 未加载），放弃安装");
         return;
     }
     orig_SSL_write = (dy_ssl_write_t)p;
-    DYAppend([NSString stringWithFormat:@"[v17] dlsym SSL_write = %p", p]);
+    DYAppend([NSString stringWithFormat:@"[v18] dlsym SSL_write = %p", p]);
 
     uint32_t total = _dyld_image_count();
     uint32_t scanned = 0;
@@ -491,19 +576,21 @@ static void dy_install(void) {
         int before = g_replaced;
         dy_rebind_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
         if (g_replaced != before) {
-            DYAppend([NSString stringWithFormat:@"[v17] 命中 image: %s（改写 %d 处）", nm, g_replaced - before]);
+            DYAppend([NSString stringWithFormat:@"[v18] 命中 image: %s（改写 %d 处）", nm, g_replaced - before]);
         }
         scanned++;
     }
-    DYAppend([NSString stringWithFormat:@"[v17] 安装完成：扫描 %u/%u 个非系统 image，改写 GOT %d 处",
+    DYAppend([NSString stringWithFormat:@"[v18] 安装完成：扫描 %u/%u 个非系统 image，改写 GOT %d 处",
               scanned, total, g_replaced]);
 
     if (g_replaced == 0) {
-        DYAppend(@"[v17] 注意：改写 0 处 → hook 未生效，抓不到数据但不影响 App");
+        DYAppend(@"[v18] 注意：改写 0 处 → hook 未生效，抓不到数据但不影响 App");
     } else {
-        DYAppend(@"[v17] 请进入任意视频评论区，发一条内容为 tt21 的评论，看到“评论成功”后退出抖音");
-        DYAppend(@"[v17] 索引在 Documents/dyprobe_dump.txt，命中段在 Documents/dyprobe_hit.txt");
+        DYAppend(@"[v18] 装好了。每 10 秒会打一行「存活 #n」，它就是时间证据");
+        DYAppend(@"[v18] 步骤：① 等 20 秒 ② 进视频评论区发 tt21 ③ 看到“评论成功” ④ 再等 10 秒 ⑤ 杀进程导出");
+        DYAppend(@"[v18] 索引 Documents/dyprobe_dump.txt；命中段 Documents/dyprobe_hit.txt");
     }
+    dy_start_timer();
 }
 
 __attribute__((constructor)) static void DYInit(void) {
@@ -514,7 +601,7 @@ __attribute__((constructor)) static void DYInit(void) {
                    dispatch_get_main_queue(), ^{
         @autoreleasepool {
             @try { dy_install(); } @catch (...) {
-                DYAppend(@"[v17] 安装异常，已忽略");
+                DYAppend(@"[v18] 安装异常，已忽略");
             }
         }
     });
